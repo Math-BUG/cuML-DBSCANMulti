@@ -1,2 +1,12 @@
 # Auto detect text files and perform LF normalization
 * text=auto
+
+# Vendored upstream sources: keep bytes identical to upstream for auditability
+third_party/** -text
+
+# Arquivos executados no cluster Linux: sempre LF, mesmo com core.autocrlf=true no
+# Windows. Com CRLF, o bash falha com "$'\r': command not found" e o make quebra nas
+# receitas — erros que não parecem ter nada a ver com quebra de linha.
+*.slm    text eol=lf
+*.sh     text eol=lf
+Makefile text eol=lf

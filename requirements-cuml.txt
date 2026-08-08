@@ -1,0 +1,31 @@
+# Baseline de comparação (RAPIDS) e cabeçalhos C++ do build.
+#
+# Instalado no MESMO venv de requirements.txt, em etapa separada, porque é um download
+# grande e é a parte que mais falha em cluster:
+#
+#   INSTALL_CUML=1 bash scripts/setup_env.sh
+#
+# Sem versão fixada de propósito: o pip resolve o que for compatível com o Python do nó.
+# No ClusterGPU/UFV (Python 3.10.12) isso cai em 26.02, que é a última série com wheels
+# cp310 — e é a mesma série da tag do cuML vendorizada em third_party/cuml. Se um dia o
+# Python do cluster mudar, confira a versão resolvida em requirements.lock.txt e alinhe a
+# tag vendorizada; ver docs/fontes-primarias.md.
+--extra-index-url https://pypi.nvidia.com
+
+cupy-cuda12x
+cuml-cu12
+
+# Trazem os cabeçalhos C++ em site-packages/{libraft,librmm}/include, usados para
+# compilar o binário CUDA. Vêm como dependência do cuml-cu12, listados aqui só para
+# deixar explícito de onde saem.
+libraft-cu12
+librmm-cu12
+
+# cuVS: é ele que faz a busca de vizinhança do DBSCAN do cuML, e o backend padrão do nosso
+# binário usa a mesma chamada. Ao contrário de libraft/librmm, NÃO veio junto do cuml-cu12
+# na instalação do ClusterGPU/UFV — por isso está listado explicitamente.
+libcuvs-cu12
+
+# raft/core/logger.hpp inclui rapids_logger/log_levels.h, que mora neste pacote (PyPI
+# público, sem sufixo de CUDA). Traz também librapids_logger.so, usada no link.
+rapids-logger

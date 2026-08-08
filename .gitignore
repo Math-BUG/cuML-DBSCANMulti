@@ -1,0 +1,13 @@
+build/
+# Baixado por scripts/fetch_rapids_headers.sh (~50 MB de cabeçalhos)
+third_party/rapids_headers/
+results/
+data/
+*.f32
+*.i32
+job_*.out
+job_*.err
+.venv/
+# requirements.lock.txt NÃO é ignorado de propósito: é o registro das versões exatas
+# usadas nos experimentos, gerado por scripts/setup_env.sh no cluster.
+__pycache__/

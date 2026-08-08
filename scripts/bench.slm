@@ -1,0 +1,120 @@
+#!/bin/bash
+#SBATCH --job-name=dbscanmulti_bench
+#SBATCH --mail-type=ALL
+#SBATCH --mail-user=matheus.antony@ufv.br
+#SBATCH --partition=scientific
+#SBATCH --qos=scientific-qos
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=64G
+#SBATCH --gres=gpu:1
+#SBATCH --time=02:00:00
+#SBATCH --output=job_%j.out
+#SBATCH --error=job_%j.err
+
+# Comparação com o baseline cuML, num único job.
+#
+# As duas metades TÊM de rodar no mesmo job: o nó é compartilhado (há vLLM ocupando outras
+# GPUs do mesmo chassi A100 SXM), então o orçamento de potência e a temperatura variam
+# entre submissões. Comparar um tempo de hoje com um de ontem mediria o vizinho, não o
+# algoritmo.
+#
+#   sbatch scripts/bench.slm
+#   sbatch --export=ALL,DATASET=moons_16d,N=200000 scripts/bench.slm
+#
+# Variáveis reconhecidas:
+#   DATASET        família do gerador (padrão: moons_16d)
+#   N              número de pontos (padrão: 100000)
+#   REPEAT         execuções medidas (padrão: 5)
+#   IMPOSTO        1 para medir também o custo por configuração isolada (padrão: 1)
+#   INDEX          auto|int32|int64 (padrão: auto, que usa int64 quando N >= 46341)
+#   NEIGH_PER_ROW  vizinhos por linha ao dimensionar o lote (padrão: pior caso N)
+#
+# INDEX e NEIGH_PER_ROW não têm equivalente no cuml.cluster.DBSCAN, então mexer neles
+# afasta a comparação do "como o usuário usaria". O campo ganho_multi_puro do resultado
+# mede só o compartilhamento entre configurações e não é afetado por eles.
+
+set -euo pipefail
+
+echo "SLURM_JOB_ID: ${SLURM_JOB_ID:-unset}"
+echo "SLURM_NODELIST: ${SLURM_NODELIST:-unset}"
+echo "CUDA_VISIBLE_DEVICES: ${CUDA_VISIBLE_DEVICES:-unset}"
+echo "date: $(date)"
+
+module --force purge
+module load GCCcore/12.2.0
+module load CUDA/12.6.0
+export PYTHONNOUSERSITE=1
+
+# O nó tem muito mais núcleos do que o job pede. Sem este limite o OpenBLAS dos wheels vê
+# todos eles, ultrapassa o NUM_THREADS com que foi compilado e chega a abortar por falha de
+# segmentação dentro do kNN do gerador de datasets (job 4809).
+export OPENBLAS_NUM_THREADS="${SLURM_CPUS_PER_TASK:-8}"
+export OMP_NUM_THREADS="${SLURM_CPUS_PER_TASK:-8}"
+export MKL_NUM_THREADS="${SLURM_CPUS_PER_TASK:-8}"
+
+PROJECT_DIR="${SLURM_SUBMIT_DIR:-$(pwd)}"
+cd "$PROJECT_DIR"
+
+VENV_DIR="${VENV_DIR:-.venv}"
+if [ ! -f "$VENV_DIR/bin/activate" ]; then
+  echo "erro: venv não encontrado em '$VENV_DIR'; rode INSTALL_CUML=1 bash scripts/setup_env.sh" >&2
+  exit 1
+fi
+# shellcheck disable=SC1090
+source "$VENV_DIR/bin/activate"
+
+# Datasets e resultados vao para a particao de dados (~/dados), nao para a HOME: a suite
+# completa passa de 2 GB, e mais ainda se entrarem N de 512k e 1M. Sobrepondo:
+#   sbatch --export=ALL,DATA_DIR=/outro/caminho ...
+DBM_BASE="${DBM_BASE:-$HOME/dados/dbscanmulti}"
+DATA_DIR="${DATA_DIR:-$DBM_BASE/data}"
+RESULTS_DIR="${RESULTS_DIR:-$DBM_BASE/results}"
+mkdir -p "$DATA_DIR" "$RESULTS_DIR"
+echo "dados:      $DATA_DIR"
+echo "resultados: $RESULTS_DIR"
+python -c "import cuml" 2>/dev/null || {
+  echo "erro: cuML ausente no venv; rode INSTALL_CUML=1 bash scripts/setup_env.sh" >&2
+  exit 1
+}
+
+DATASET="${DATASET:-moons_16d}"
+N="${N:-100000}"
+REPEAT="${REPEAT:-5}"
+IMPOSTO="${IMPOSTO:-1}"
+
+nvidia-smi --query-gpu=name,memory.used,memory.total --format=csv
+
+# --- build ---------------------------------------------------------------
+COMPUTE_CAP="$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader | head -n1 | tr -d '.')"
+CUDA_ARCH="sm_${COMPUTE_CAP:-80}"
+echo "--- build (${CUDA_ARCH}) ---"
+make CUDA_ARCH="$CUDA_ARCH" LINK_RAFT="${LINK_RAFT:-1}"
+
+# --- dataset -------------------------------------------------------------
+META="$DATA_DIR/${DATASET}_n${N}.json"
+if [ ! -f "$META" ]; then
+  echo "--- gerando ${DATASET} com N=${N} ---"
+  python tools/gerar_datasets.py --dataset "$DATASET" --n "$N" --out-dir "$DATA_DIR" >/dev/null
+fi
+echo "meta: $META"
+
+# --- medição -------------------------------------------------------------
+SAIDA="$RESULTS_DIR/bench_${DATASET}_n${N}_${SLURM_JOB_ID:-local}.json"
+
+ARGS=(--meta "$META" --repeat "$REPEAT" --validar --out "$SAIDA")
+if [ "$IMPOSTO" = "1" ]; then
+  ARGS+=(--imposto)
+fi
+if [ -n "${INDEX:-}" ]; then
+  ARGS+=(--index "$INDEX")
+fi
+if [ -n "${NEIGH_PER_ROW:-}" ]; then
+  ARGS+=(--neigh-per-row "$NEIGH_PER_ROW")
+fi
+
+echo "--- medição ---"
+python tools/bench_vs_cuml.py "${ARGS[@]}"
+
+echo "Finalizado em: $(date)"

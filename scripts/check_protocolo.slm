@@ -1,0 +1,155 @@
+#!/bin/bash
+#SBATCH --job-name=dbscanmulti_protocolo
+#SBATCH --mail-type=ALL
+#SBATCH --mail-user=matheus.antony@ufv.br
+#SBATCH --partition=scientific
+#SBATCH --qos=scientific-qos
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=32G
+#SBATCH --gres=gpu:1
+#SBATCH --time=00:30:00
+#SBATCH --output=job_%j.out
+#SBATCH --error=job_%j.err
+
+# Job curto: compara três formas de medir uma configuração isolada.
+#
+#   A  um processo por configuração        — referência; inclui a alocação do workspace em
+#                                            cada uma, como o cuml.cluster.DBSCAN faz
+#   B  mesmo processo, tudo recriado       — reproduz a degradação de 2,3x (jobs 4862/4863)
+#   C  mesmo processo, workspace reusado   — o modo corrigido, e o padrão do binário
+#
+# O que se descobriu por aqui: o workspace chega a ~10 GB (a adjacência densa é
+# N x batch_size bytes) e é alocado DENTRO da região cronometrada. Recriá-lo por chamada
+# fazia a segunda configuração em diante custar 2,3x a primeira. Reaproveitá-lo elimina o
+# efeito e ainda fica ~13% abaixo de A, que é o custo da alocação (~14 ms em N=100k).
+#
+# Rode de novo sempre que mexer na alocação do workspace ou no dimensionamento do lote.
+#
+#   sbatch scripts/check_protocolo.slm
+#   sbatch --export=ALL,DATASET=core_halo_16d,N=100000 scripts/check_protocolo.slm
+
+set -euo pipefail
+
+echo "SLURM_JOB_ID: ${SLURM_JOB_ID:-unset}"
+echo "CUDA_VISIBLE_DEVICES: ${CUDA_VISIBLE_DEVICES:-unset}"
+echo "date: $(date)"
+
+module --force purge
+module load GCCcore/12.2.0
+module load CUDA/12.6.0
+export PYTHONNOUSERSITE=1
+export OPENBLAS_NUM_THREADS="${SLURM_CPUS_PER_TASK:-8}"
+export OMP_NUM_THREADS="${SLURM_CPUS_PER_TASK:-8}"
+export MKL_NUM_THREADS="${SLURM_CPUS_PER_TASK:-8}"
+
+PROJECT_DIR="${SLURM_SUBMIT_DIR:-$(pwd)}"
+cd "$PROJECT_DIR"
+
+VENV_DIR="${VENV_DIR:-.venv}"
+[ -f "$VENV_DIR/bin/activate" ] || { echo "erro: venv não encontrado em '$VENV_DIR'" >&2; exit 1; }
+# shellcheck disable=SC1090
+source "$VENV_DIR/bin/activate"
+
+# Datasets e resultados vao para a particao de dados (~/dados), nao para a HOME: a suite
+# completa passa de 2 GB, e mais ainda se entrarem N de 512k e 1M. Sobrepondo:
+#   sbatch --export=ALL,DATA_DIR=/outro/caminho ...
+DBM_BASE="${DBM_BASE:-$HOME/dados/dbscanmulti}"
+DATA_DIR="${DATA_DIR:-$DBM_BASE/data}"
+RESULTS_DIR="${RESULTS_DIR:-$DBM_BASE/results}"
+mkdir -p "$DATA_DIR" "$RESULTS_DIR"
+echo "dados:      $DATA_DIR"
+echo "resultados: $RESULTS_DIR"
+
+DATASET="${DATASET:-many_blobs_16d}"
+N="${N:-100000}"
+REPEAT="${REPEAT:-5}"
+NEIGH_PER_ROW="${NEIGH_PER_ROW:-512}"
+
+COMPUTE_CAP="$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader | head -n1 | tr -d '.')"
+echo "--- build (sm_${COMPUTE_CAP:-80}) ---"
+make CUDA_ARCH="sm_${COMPUTE_CAP:-80}" LINK_RAFT="${LINK_RAFT:-1}"
+
+META="$DATA_DIR/${DATASET}_n${N}.json"
+if [ ! -f "$META" ]; then
+  echo "--- gerando ${DATASET} N=${N} ---"
+  python tools/gerar_datasets.py --dataset "$DATASET" --n "$N" --out-dir "$DATA_DIR" >/dev/null
+fi
+
+TAG="${SLURM_JOB_ID:-local}"
+
+comum=(--meta "$META" --repeat "$REPEAT" --neigh-per-row "$NEIGH_PER_ROW" --imposto)
+
+echo ""
+echo "=============== A: um processo por configuração (referência) ==============="
+python tools/bench_vs_cuml.py "${comum[@]}" --imposto-por-processo \
+  --out "$RESULTS_DIR/proto_${TAG}_processo.json" | grep -vE "^\[.*CUML.*\]"
+
+D_META="$(python -c "import json;print(json.load(open('$META'))['d'])")"
+EPS_META="$(python -c "import json;print(','.join(f'{v:.10g}' for v in json.load(open('$META'))['eps']))")"
+MP_META="$(python -c "import json;print(','.join(str(v) for v in json.load(open('$META'))['min_samples']))")"
+
+solo_direto() {  # $1 = flag extra, $2 = arquivo de saída
+  "${BINARIO:-./build/dbscan_multi}" \
+    --input "$DATA_DIR/${DATASET}_n${N}.f32" --n "$N" --d "$D_META" \
+    --eps "$EPS_META" --min-samples "$MP_META" \
+    --repeat "$REPEAT" --warmup 1 --neigh-per-row "$NEIGH_PER_ROW" \
+    "$1" --json | tail -1 > "$2"
+  echo "gravado em $2"
+}
+
+# B reproduz o defeito: tudo recriado por configuração, inclusive o workspace de ~10 GB.
+echo ""
+echo "=============== B: mesmo processo, tudo recriado por configuração ==============="
+solo_direto --solo-isolado "$RESULTS_DIR/proto_${TAG}_inprocess.json"
+
+# C é o modo corrigido e o padrão do binário: handle e workspace reaproveitados.
+echo ""
+echo "=============== C: mesmo processo, workspace reaproveitado ==============="
+solo_direto --solo "$RESULTS_DIR/proto_${TAG}_handle.json"
+
+echo ""
+echo "=============== comparação ==============="
+python - "$RESULTS_DIR/proto_${TAG}_processo.json" "$RESULTS_DIR/proto_${TAG}_inprocess.json" \
+         "$RESULTS_DIR/proto_${TAG}_handle.json" <<'PY'
+import json, sys
+
+ref = json.loads(open(sys.argv[1], encoding="utf-8").read())
+inp = json.loads(open(sys.argv[2], encoding="utf-8").read())
+hnd = json.loads(open(sys.argv[3], encoding="utf-8").read())
+
+a = [c["nosso_solo_ms"] for c in ref["por_config"]]
+b = [float(v) for v in inp.get("solo_ms", [])]
+c = [float(v) for v in hnd.get("solo_ms", [])]
+
+print(f"{'#':>3}{'eps':>10}{'minPts':>8}"
+      f"{'A processo':>12}{'B recriado':>15}{'C reaproveitado':>17}"
+      f"{'B/A':>7}{'C/A':>7}")
+for i, cfg in enumerate(ref["por_config"]):
+    ci = c[i] if i < len(c) else float("nan")
+    bi = b[i] if i < len(b) else float("nan")
+    print(f"{i:>3}{cfg['eps']:>10.5g}{cfg['min_samples']:>8}"
+          f"{a[i]:>12.2f}{bi:>15.2f}{ci:>17.2f}"
+          f"{bi/a[i]:>6.2f}x{ci/a[i]:>6.2f}x")
+
+def razao(x):
+    """Quanto a segunda configuração em diante custa em relação à primeira."""
+    if len(x) < 2 or not x[0]:
+        return float("nan")
+    return (sum(x[1:]) / len(x[1:])) / x[0]
+
+print(f"\ndegradação da 1a para as demais configurações:")
+print(f"  A  um processo por configuração        : {razao(a):.2f}x")
+print(f"  B  mesmo processo, tudo recriado       : {razao(b):.2f}x")
+print(f"  C  mesmo processo, workspace reusado   : {razao(c):.2f}x")
+
+print("\nleitura:")
+print("  C ~1x  -> corrigido: reaproveitar o workspace elimina a degradação, e C passa a")
+print("            ser o protocolo de medição (mais barato e simétrico com o baseline)")
+print("  C ~B   -> reaproveitar o workspace não bastou; a causa está em outro lugar e o")
+print("            protocolo A continua sendo o único confiável")
+PY
+
+echo ""
+echo "Finalizado em: $(date)"

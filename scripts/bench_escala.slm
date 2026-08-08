@@ -1,0 +1,306 @@
+#!/bin/bash
+#SBATCH --job-name=dbscanmulti_escala
+#SBATCH --mail-type=ALL
+#SBATCH --mail-user=matheus.antony@ufv.br
+#SBATCH --partition=scientific
+#SBATCH --qos=scientific-qos
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=64G
+#SBATCH --gres=gpu:1
+#SBATCH --time=06:00:00
+#SBATCH --output=job_%j.out
+#SBATCH --error=job_%j.err
+
+# Ganho do multi em função de N, para uma família de dataset.
+#
+# O custo da busca de vizinhança cresce com N², e o da rotulagem com N (mais o número de
+# componentes). Como o multi compartilha a primeira e paga a segunda por configuração, o
+# ganho deve CRESCER com N. Esta varredura é o que mostra se isso acontece de fato.
+#
+#   sbatch scripts/bench_escala.slm
+#   sbatch --export=ALL,DIMS=32 scripts/bench_escala.slm
+#   sbatch --export=ALL,DATASET=core_halo_16d scripts/bench_escala.slm
+#
+# Cuidado ao passar listas por --export: a vírgula também separa variáveis. Ponha a lista
+# entre aspas simples, senão o Slurm lê o segundo item como uma variável a mais:
+#   sbatch --export=ALL,'DATASET=uniform_16d,filaments_16d' scripts/bench_escala.slm
+#
+# Uma submissão por dimensão é a forma prática de dividir a varredura completa em jobs que
+# cabem no wall time — e as duas podem correr em GPUs diferentes ao mesmo tempo, desde que
+# os números finais sejam refeitos numa GPU só.
+#
+# Duas varreduras, duas perguntas diferentes — não faça o produto cartesiano das duas:
+#
+#   (a) Ganho em função de N, sobre muitas famílias. É o padrão: DIMS=2,16 basta, porque a
+#       pergunta é sobre o formato dos dados, não sobre a dimensão.
+#
+#   (b) Ganho em função de D, sobre poucas famílias e N fixo. Progressão GEOMÉTRICA: o
+#       custo da busca é O(N²·D), então cada dobra de D dobra o tempo e uma progressão
+#       aritmética gastaria medições numa faixa estreita. Acrescente 17 e 33 se quiser
+#       detectar degraus de tiling logo acima de 16 e 32.
+#
+#         sbatch --export=ALL,'FAMILIAS=dense_blobs,moons,uniform',\
+#           'DIMS=2,4,8,16,32,64','NS=64000' scripts/bench_escala.slm
+#
+#       As três famílias são complementares: dense_blobs é genuinamente D-dimensional,
+#       moons tem estrutura 2D com colunas extras ruidosas (a dimensão intrínseca não muda,
+#       só o custo por par), e uniform é onde a concentração de distâncias em D alto pesa
+#       mais — é a família em que o ganho do Multi-EPS deve cair primeiro, porque os eps
+#       escolhidos ficam colados e o nnz de cada raio deixa de diferir.
+#
+# Variáveis:
+#   FAMILIAS       famílias SEM sufixo de dimensão, separadas por vírgula
+#   DIMS           dimensões, separadas por vírgula (padrão: 2,16)
+#   DATASET        sobrepõe FAMILIAS x DIMS, com o sufixo já pronto
+#   NS             lista de N separada por vírgula
+#   REPEAT         execuções medidas por ponto (padrão: 5; cai para 3 acima de 256k)
+#   NEIGH_PER_ROW  vizinhos por linha ao dimensionar o lote (padrão: vazio = pior caso do
+#                  cuML; ver a nota junto da variável antes de mexer)
+#
+# Aviso de tempo: o baseline cuML custa ~O(N²). Em N=100k uma configuração leva ~150 ms;
+# em N=1M leva ~15 s, e a grade de 12 configurações com repetições passa de 40 minutos só
+# no baseline. Inclua 1000000 na lista sabendo disso.
+
+set -euo pipefail
+
+echo "SLURM_JOB_ID: ${SLURM_JOB_ID:-unset}"
+echo "CUDA_VISIBLE_DEVICES: ${CUDA_VISIBLE_DEVICES:-unset}"
+echo "date: $(date)"
+
+module --force purge
+module load GCCcore/12.2.0
+module load CUDA/12.6.0
+export PYTHONNOUSERSITE=1
+export OPENBLAS_NUM_THREADS="${SLURM_CPUS_PER_TASK:-8}"
+export OMP_NUM_THREADS="${SLURM_CPUS_PER_TASK:-8}"
+export MKL_NUM_THREADS="${SLURM_CPUS_PER_TASK:-8}"
+
+PROJECT_DIR="${SLURM_SUBMIT_DIR:-$(pwd)}"
+cd "$PROJECT_DIR"
+
+VENV_DIR="${VENV_DIR:-.venv}"
+[ -f "$VENV_DIR/bin/activate" ] || { echo "erro: venv não encontrado em '$VENV_DIR'" >&2; exit 1; }
+# shellcheck disable=SC1090
+source "$VENV_DIR/bin/activate"
+
+# Datasets e resultados vao para a particao de dados (~/dados), nao para a HOME: a suite
+# completa passa de 2 GB, e mais ainda se entrarem N de 512k e 1M. Sobrepondo:
+#   sbatch --export=ALL,DATA_DIR=/outro/caminho ...
+DBM_BASE="${DBM_BASE:-$HOME/dados/dbscanmulti}"
+DATA_DIR="${DATA_DIR:-$DBM_BASE/data}"
+RESULTS_DIR="${RESULTS_DIR:-$DBM_BASE/results}"
+mkdir -p "$DATA_DIR" "$RESULTS_DIR"
+echo "dados:      $DATA_DIR"
+echo "resultados: $RESULTS_DIR"
+
+# Famílias da varredura, uma por linha, SEM o sufixo de dimensão — ele é composto abaixo
+# a partir de DIMS. Comente o que não quiser medir: a varredura é o produto
+# famílias x dimensões x tamanhos, então cada linha aqui custa len(DIMS)*len(NS) medições.
+FAMILIAS_PADRAO=(
+  # --- catálogo original: variam o FORMATO do cluster ---
+  dense_blobs           # 4 blobs compactos, bem separados — caso fácil de referência
+  heterogeneous_blobs   # 3 grupos com densidades muito diferentes, um único eps sofre
+  blobs                 # 6 blobs esféricos, variância moderada
+  dense_blobs_noise     # blobs densos + 20% de ruído uniforme rotulado -1
+  moons                 # duas luas entrelaçadas, não convexo
+  rings                 # anéis concêntricos, não convexo com buraco
+  spiral                # 3 braços espirais, conectividade por densidade
+  anisotropic_blobs     # blobs esticados por transformação linear
+  varied_blobs          # 4 blobs com desvios de 0,08 a 0,75
+  chain_bridge          # dois blocos ligados por ponte esparsa
+  grid_blobs            # grade 3x3 de microblobs
+
+  # --- acrescentados aqui: variam o REGIME que a execução multi enfrenta ---
+  nested_blobs          # dois níveis; nenhum eps único vê os dois
+  core_halo             # núcleo denso + halo difuso; o raio muda o resultado
+  power_law_blobs       # grau por ponto varia ~10x, desbalanceia os blocos por linha
+  many_blobs            # centenas de componentes: caso caro para a rotulagem
+  uniform               # sem estrutura; nnz cresce suave, ganho do multi encolhe
+  filaments             # dimensão intrínseca 1; regime de nnz oposto ao de uniform
+)
+
+# Dimensões. O que D significa depende da família: em dense_blobs, uniform, filaments e
+# power_law_blobs a estrutura é genuinamente D-dimensional; em moons, rings, spiral,
+# grid_blobs e afins a estrutura é 2D e as colunas extras são combinações ruidosas das
+# duas primeiras (ver _augmentar_2d_para_dim). Por isso vale ter um D baixo e um alto: no
+# primeiro grupo isso muda a geometria, no segundo muda só o custo por par.
+# Progressão geométrica: o custo da busca é O(N²·D), então cada dobra de D dobra o tempo e
+# sete pontos custam ~2x o último. Uma progressão aritmética gastaria medições numa faixa
+# estreita sem mostrar nada novo.
+DIMS="${DIMS:-2,4,8,16,32,64,128}"
+
+FAMILIAS="${FAMILIAS:-$(IFS=,; echo "${FAMILIAS_PADRAO[*]}")}"
+NS="${NS:-4000,16000,32000,64000,128000,256000}"
+INDEX="${INDEX:-auto}"
+
+# Vizinhos por linha: VAZIO por padrão, que é o pior caso do cuML (N por linha).
+#
+# Era 512, e foi o que derrubou os jobs 4866-4871 em heterogeneous_blobs: o palpite
+# dimensiona o lote ANTES da busca, e naquela família o grau real chegou a 56 mil por
+# linha. O lote saiu do tamanho do dataset inteiro e o CSR não coube em 80 GB. O runner
+# agora mede e refaz o lote em vez de estourar, mas uma varredura em que cada dataset
+# roda com um lote diferente não compara coisa nenhuma.
+#
+# Além disso o parâmetro não tem equivalente no cuml.cluster.DBSCAN: deixá-lo no padrão do
+# cuML é o que torna o speedup uma comparação botão-a-botão. Para medir o efeito dele,
+# rode uma família de cada vez com NEIGH_PER_ROW explícito e compare com esta linha de base.
+NEIGH_PER_ROW="${NEIGH_PER_ROW:-}"
+
+# DATASET, se vier do ambiente, sobrepõe famílias x dimensões e já traz o sufixo pronto.
+if [ -z "${DATASET:-}" ]; then
+  nomes=()
+  for fam in ${FAMILIAS//,/ }; do
+    for d in ${DIMS//,/ }; do
+      nomes+=("${fam}_${d}d")
+    done
+  done
+  DATASET="$(IFS=,; echo "${nomes[*]}")"
+fi
+
+COMPUTE_CAP="$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader | head -n1 | tr -d '.')"
+echo "--- build (sm_${COMPUTE_CAP:-80}) ---"
+make CUDA_ARCH="sm_${COMPUTE_CAP:-80}" LINK_RAFT="${LINK_RAFT:-1}"
+
+nvidia-smi --query-gpu=name,memory.used,memory.total --format=csv
+
+TAG="${SLURM_JOB_ID:-local}"
+
+N_DS=$(echo "$DATASET" | tr ',' '\n' | grep -c .)
+N_TAM=$(echo "$NS" | tr ',' '\n' | grep -c .)
+echo ""
+echo "dimensões: ${DIMS}"
+echo "tamanhos ($N_TAM): ${NS}"
+echo "datasets ($N_DS): ${DATASET}"
+echo "medições: $((N_DS * N_TAM))"
+
+# Estimativa de duração antes de gastar a fila. O modelo vem das medições já feitas:
+# uma configuração custa ~150 ms em N=100k, D=16, e escala com N²·D. Cada medição roda a
+# grade no cuML, a grade no nosso binário e o modo --imposto, que lança um processo por
+# configuração — e a criação de contexto CUDA desses processos não é desprezível.
+python - "$DATASET" "$NS" "${REPEAT:-5}" <<'PY' || true
+import sys
+
+datasets = [d for d in sys.argv[1].split(",") if d]
+ns = [int(v) for v in sys.argv[2].split(",") if v]
+rep_base = int(sys.argv[3])
+
+T_REF, N_REF, D_REF = 0.150, 100_000, 16   # segundos por configuração, na referência
+N_CFG, ARRANQUE = 12, 2.0                  # grade típica 3x4; segundos por processo novo
+
+etapas = {"baseline cuML": 0.0, "nossa grade": 0.0, "nosso solo (--imposto)": 0.0,
+          "arranque de processo": 0.0}
+for ds in datasets:
+    d = int(ds.rsplit("_", 1)[-1].rstrip("d"))
+    for n in ns:
+        rep = 3 if n > 256_000 else rep_base
+        t = T_REF * (n / N_REF) ** 2 * (d / D_REF)
+        etapas["baseline cuML"] += N_CFG * (1 + rep) * t
+        etapas["nossa grade"] += (1 + rep) * 1.6 * t
+        etapas["nosso solo (--imposto)"] += N_CFG * (1 + rep) * 0.8 * t
+        # Desde que --solo mede as configurações isoladas dentro do mesmo processo, são
+        # dois arranques por medição (o binário e o Python do baseline), não N_CFG + 1.
+        etapas["arranque de processo"] += 2 * ARRANQUE
+
+total = sum(etapas.values())
+h, m = divmod(int(total / 60), 60)
+print(f"duração estimada: ~{h}h{m:02d}min  (wall time do job: 06:00)")
+for nome, seg in sorted(etapas.items(), key=lambda kv: -kv[1]):
+    hh, mm = divmod(int(seg / 60), 60)
+    print(f"  {nome:<24} {hh:>2}h{mm:02d}min  ({100 * seg / total:4.1f}%)")
+
+if total > 5.5 * 3600:
+    print("\nATENÇÃO: passa do wall time. Opções, da que menos perde informação para a que mais:")
+    print("  1) dividir por dimensão:  for D in 2 4 8 16 32 64 128; do")
+    print("       sbatch --export=ALL,DIMS=$D scripts/bench_escala.slm; done")
+    print("  2) menos famílias em D alto: D multiplica o custo por par de forma quase")
+    print("     linear, então 17 famílias reconfirmam 17 vezes o mesmo fator;")
+    print("  3) REPEAT=3: o desvio entre repetições foi ~1% nas medições feitas;")
+    print("  4) sem --imposto: some ganho_multi_puro e T, e com eles a separação entre o")
+    print("     ganho do multi e a vantagem de lote. Só faça se já tiver esses números.")
+PY
+
+# Gerar dataset é trabalho de CPU e não deveria consumir alocação de GPU. O laço abaixo
+# gera o que faltar, mas o certo é rodar antes, no nó de login, o comando que sai no aviso.
+FALTANDO=0
+for DS in ${DATASET//,/ }; do
+  for N in ${NS//,/ }; do
+    [ -f "$DATA_DIR/${DS}_n${N}.json" ] || FALTANDO=$((FALTANDO + 1))
+  done
+done
+if [ "$FALTANDO" -gt 0 ]; then
+  {
+    echo "aviso: $FALTANDO datasets serão gerados dentro do job (CPU), gastando tempo de GPU."
+    echo "       Para gerar antes, no nó de login:"
+    echo ""
+    echo "  python tools/gerar_datasets.py --suite \\"
+    echo "    --familias $FAMILIAS \\"
+    echo "    --dims $DIMS --ns $NS --out-dir $DATA_DIR"
+    echo ""
+  } >&2
+fi
+
+for DS in ${DATASET//,/ }; do
+  for N in ${NS//,/ }; do
+    META="$DATA_DIR/${DS}_n${N}.json"
+    if [ ! -f "$META" ]; then
+      echo ""
+      echo "--- gerando ${DS} N=${N} ---"
+      python tools/gerar_datasets.py --dataset "$DS" --n "$N" --out-dir "$DATA_DIR" >/dev/null
+    fi
+
+    # Menos repetições nos N grandes: a variância relativa cai com o tempo de execução, e o
+    # baseline cuML custa O(N²) — cinco repetições em 1M seriam horas de fila por um dígito.
+    if [ "$N" -gt 256000 ]; then
+      REP="${REPEAT:-3}"
+    else
+      REP="${REPEAT:-5}"
+    fi
+
+    echo ""
+    echo "=============== ${DS}  N=${N}  (repeat=${REP}) ==============="
+    ARGS=(--meta "$META" --repeat "$REP" --index "$INDEX"
+          --imposto --validar --out "$RESULTS_DIR/esc_${TAG}_${DS}_n${N}.json")
+    # if, e não `[ ... ] && ...`: sob `set -e` um teste falso derrubaria o job.
+    if [ -n "$NEIGH_PER_ROW" ]; then ARGS+=(--neigh-per-row "$NEIGH_PER_ROW"); fi
+    python tools/bench_vs_cuml.py "${ARGS[@]}" | grep -vE "^\[.*CUML.*\]"
+  done
+done
+
+echo ""
+echo "=============== resumo ==============="
+python - "$RESULTS_DIR" "$TAG" <<'PY'
+import json, sys
+from pathlib import Path
+
+res_dir, tag = sys.argv[1], sys.argv[2]
+por_familia = {}
+for p in Path(res_dir).glob(f"esc_{tag}_*_n*.json"):
+    d = json.loads(p.read_text(encoding="utf-8"))
+    por_familia.setdefault(d["dataset"], []).append(
+        (d["n"], d["configuration_count"], d["multi_ms"], d["cuml_sequencial_ms"],
+         d["speedup"], d.get("ganho_multi_puro", float("nan")),
+         d.get("imposto_mediano", float("nan")), d.get("particoes_identicas", -1)))
+
+print("O ganho deve CRESCER com N: a busca de vizinhança (compartilhada) é O(N²) e a")
+print("rotulagem (por configuração) é ~O(N). Se ficar plano, a rotulagem está dominando —")
+print("e é por isso que vale comparar uma família com muitos componentes contra uma com")
+print("poucos: o número de componentes é justamente o que encarece a rotulagem.\n")
+
+for familia in sorted(por_familia):
+    linhas = sorted(por_familia[familia])
+    print(f"--- {familia} ---")
+    print(f"{'N':>9}{'cfg':>5}{'multi_ms':>11}{'cuml_seq_ms':>13}"
+          f"{'speedup':>9}{'ganho_puro':>12}{'T':>7}{'idênticas':>11}")
+    for n, c, mm, cs, sp, gp, t, ident in linhas:
+        print(f"{n:>9}{c:>5}{mm:>11.1f}{cs:>13.1f}{sp:>8.2f}x{gp:>11.2f}x"
+              f"{t:>6.2f}x{ident:>8}/{c}")
+    if len(linhas) >= 2:
+        print(f"  ganho puro: {linhas[0][5]:.2f}x em N={linhas[0][0]}"
+              f"  ->  {linhas[-1][5]:.2f}x em N={linhas[-1][0]}")
+    print()
+PY
+
+echo ""
+echo "Finalizado em: $(date)"

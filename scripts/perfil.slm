@@ -1,0 +1,151 @@
+#!/bin/bash
+#SBATCH --job-name=dbscanmulti_perfil
+#SBATCH --mail-type=ALL
+#SBATCH --mail-user=matheus.antony@ufv.br
+#SBATCH --partition=scientific
+#SBATCH --qos=scientific-qos
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=64G
+#SBATCH --gres=gpu:1
+#SBATCH --time=00:40:00
+#SBATCH --output=job_%j.out
+#SBATCH --error=job_%j.err
+
+# Onde o tempo vai, fase a fase, em dois datasets escolhidos por serem opostos.
+#
+# A pergunta: por que uma configuração EXTRA na grade chega a custar mais que uma execução
+# independente inteira? Em heterogeneous_blobs_64d N=64k o marginal foi 178,5 ms contra
+# 122,7 ms de execução completa (1,46x). Em filaments_64d, mesma grade e mesmo N, o
+# marginal foi 5,3 ms contra 65,0 ms (0,08x). Mesmo binário, mesma forma de grade — o que
+# muda é o nnz. Comparar os dois perfis isola a fase que escala com nnz.
+#
+# O que procurar na saída: a linha "pago por configuração". Se ela for pequena nos dois, o
+# gargalo é compartilhado e o teto do ganho é alto; se ela explodir no heterogeneous, a
+# fase marcada POR CONFIGURAÇÃO é o defeito, e o desenho precisa mudar.
+#
+#   sbatch scripts/perfil.slm
+#   sbatch --export=ALL,'DATASETS=core_halo_64d,many_blobs_64d',N=64000 scripts/perfil.slm
+
+set -euo pipefail
+
+echo "SLURM_JOB_ID: ${SLURM_JOB_ID:-unset}"
+echo "CUDA_VISIBLE_DEVICES: ${CUDA_VISIBLE_DEVICES:-unset}"
+echo "date: $(date)"
+
+module --force purge
+module load GCCcore/12.2.0
+module load CUDA/12.6.0
+export PYTHONNOUSERSITE=1
+export OPENBLAS_NUM_THREADS="${SLURM_CPUS_PER_TASK:-8}"
+export OMP_NUM_THREADS="${SLURM_CPUS_PER_TASK:-8}"
+export MKL_NUM_THREADS="${SLURM_CPUS_PER_TASK:-8}"
+
+PROJECT_DIR="${SLURM_SUBMIT_DIR:-$(pwd)}"
+cd "$PROJECT_DIR"
+
+VENV_DIR="${VENV_DIR:-.venv}"
+[ -f "$VENV_DIR/bin/activate" ] || { echo "erro: venv não encontrado em '$VENV_DIR'" >&2; exit 1; }
+# shellcheck disable=SC1090
+source "$VENV_DIR/bin/activate"
+
+DBM_BASE="${DBM_BASE:-$HOME/dados/dbscanmulti}"
+DATA_DIR="${DATA_DIR:-$DBM_BASE/data}"
+mkdir -p "$DATA_DIR"
+echo "dados: $DATA_DIR"
+
+# Um que perde (ganho_puro 0,81x) e um que ganha (6,35x), no mesmo N e na mesma dimensão.
+DATASETS="${DATASETS:-heterogeneous_blobs_64d,filaments_64d}"
+N="${N:-64000}"
+
+COMPUTE_CAP="$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader | head -n1 | tr -d '.')"
+echo "--- build (sm_${COMPUTE_CAP:-80}) ---"
+make CUDA_ARCH="sm_${COMPUTE_CAP:-80}" LINK_RAFT="${LINK_RAFT:-1}"
+
+for DS in ${DATASETS//,/ }; do
+  META="$DATA_DIR/${DS}_n${N}.json"
+  if [ ! -f "$META" ]; then
+    echo "--- gerando ${DS} N=${N} ---"
+    python tools/gerar_datasets.py --dataset "$DS" --n "$N" --out-dir "$DATA_DIR" >/dev/null
+  fi
+
+  D="$(python -c "import json;print(json.load(open('$META'))['d'])")"
+  EPS="$(python -c "import json;print(','.join(f'{v:.10g}' for v in json.load(open('$META'))['eps']))")"
+  MP="$(python -c "import json;print(','.join(str(v) for v in json.load(open('$META'))['min_samples']))")"
+
+  # O maior raio e o minPts do meio: é a configuração mais cara da grade, e a que melhor
+  # serve de referência para o custo por configuração.
+  EPS1="$(python -c "import json;print(f\"{max(json.load(open('$META'))['eps']):.10g}\")")"
+  MP1="$(python -c "import json;m=sorted(json.load(open('$META'))['min_samples']);print(m[len(m)//2])")"
+
+  echo ""
+  echo "=============== ${DS}  N=${N}  D=${D} ==============="
+  echo "eps:     $EPS"
+  echo "minPts:  $MP"
+
+  # Perfil de UMA configuração, para comparar fase a fase com o da grade. Sem isto o custo
+  # por configuração do multi só pode ser comparado com o TOTAL de uma execução isolada, e
+  # foi assim que li um `busca` de 2 execuções como se fosse de uma e enxerguei uma anomalia
+  # no weak_cc que não existia.
+  echo ""
+  echo "--- referência: 1 configuração (eps=$EPS1 minPts=$MP1) ---"
+  SOLO="$(mktemp)"
+  ./build/dbscan_multi \
+    --input "$DATA_DIR/${DS}_n${N}.f32" --n "$N" --d "$D" \
+    --eps "$EPS1" --min-samples "$MP1" \
+    --warmup 1 --repeat 3 --perfil --json > "$SOLO" 2>&1
+  grep -E "^\[perfil\]" "$SOLO" || cat "$SOLO"
+  python - "$SOLO" <<'PY'
+import json, sys
+for linha in open(sys.argv[1], encoding="utf-8", errors="replace"):
+    if linha.startswith("{"):
+        try:
+            d = json.loads(linha)
+        except Exception:
+            continue
+        print(f"\n  fit_ms de 1 configuração: {d['fit_ms']:9.1f} ms")
+PY
+  rm -f "$SOLO"
+
+  echo ""
+  echo "--- grade completa ---"
+
+  # O perfil sai em stderr; junta com stdout num arquivo. Não dá para canalizar direto
+  # para `python -` com heredoc: o heredoc toma o stdin e a saída do binário se perde.
+  SAIDA="$(mktemp)"
+  ./build/dbscan_multi \
+    --input "$DATA_DIR/${DS}_n${N}.f32" --n "$N" --d "$D" \
+    --eps "$EPS" --min-samples "$MP" \
+    --warmup 1 --repeat 3 --perfil --solo --json > "$SAIDA" 2>&1
+
+  python - "$SAIDA" <<'PY'
+import json, sys
+
+for linha in open(sys.argv[1], encoding="utf-8", errors="replace"):
+    linha = linha.rstrip("\n")
+    if not linha.startswith("{"):
+        print(linha)
+        continue
+    try:
+        d = json.loads(linha)
+    except Exception:
+        print(linha)
+        continue
+    solo  = [float(v) for v in d.get("solo_ms", [])]
+    n_cfg = d["configuration_count"]
+    print(f"\n  grade inteira (fit_ms) : {d['fit_ms']:9.1f} ms  ({n_cfg} configurações)")
+    if len(solo) > 1:
+        s1 = min(solo)
+        marginal = (d["fit_ms"] - s1) / (n_cfg - 1)
+        print(f"  uma config isolada     : {s1:9.1f} ms")
+        print(f"  soma das isoladas      : {sum(solo):9.1f} ms")
+        print(f"  ganho do multi         : {sum(solo) / d['fit_ms']:9.2f}x")
+        print(f"  marginal por config    : {marginal:9.1f} ms  "
+              f"({marginal / s1:.2f}x uma execução inteira)")
+PY
+  rm -f "$SAIDA"
+done
+
+echo ""
+echo "Finalizado em: $(date)"

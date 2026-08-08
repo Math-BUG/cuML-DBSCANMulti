@@ -1,0 +1,104 @@
+#!/bin/bash
+#SBATCH --job-name=dbscanmulti_check
+#SBATCH --mail-type=ALL
+#SBATCH --mail-user=matheus.antony@ufv.br
+#SBATCH --partition=scientific
+#SBATCH --qos=scientific-qos
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=32G
+#SBATCH --gres=gpu:1
+#SBATCH --time=00:30:00
+#SBATCH --output=job_%j.out
+#SBATCH --error=job_%j.err
+
+# Job curto de sanidade: compila o binário e roda a verificação embutida.
+# Não rode isso no nó de login — o acesso direto à GPU pode estar bloqueado.
+#
+#   sbatch scripts/check_gpu.slm
+#   squeue --me
+#   cat job_<jobid>.out
+
+set -euo pipefail
+
+echo "SLURM_JOB_ID: ${SLURM_JOB_ID:-unset}"
+echo "SLURM_NODELIST: ${SLURM_NODELIST:-unset}"
+echo "CUDA_VISIBLE_DEVICES: ${CUDA_VISIBLE_DEVICES:-unset}"
+echo "hostname: $(hostname)"
+echo "date: $(date)"
+echo "pwd: $(pwd)"
+
+module --force purge
+module load GCCcore/12.2.0
+module load CUDA/12.6.0
+
+# Isola o venv do site-packages da HOME, como no setup do INF-494.
+export PYTHONNOUSERSITE=1
+
+# Limita as bibliotecas nativas às CPUs alocadas; sem isso o OpenBLAS dos wheels enxerga
+# todos os núcleos do nó e ultrapassa o NUM_THREADS com que foi compilado.
+export OPENBLAS_NUM_THREADS="${SLURM_CPUS_PER_TASK:-8}"
+export OMP_NUM_THREADS="${SLURM_CPUS_PER_TASK:-8}"
+export MKL_NUM_THREADS="${SLURM_CPUS_PER_TASK:-8}"
+
+nvidia-smi
+
+PROJECT_DIR="${SLURM_SUBMIT_DIR:-$(pwd)}"
+cd "$PROJECT_DIR"
+echo "project_dir: $(pwd)"
+
+VENV_DIR="${VENV_DIR:-.venv}"
+if [ -f "$VENV_DIR/bin/activate" ]; then
+  # shellcheck disable=SC1090
+  source "$VENV_DIR/bin/activate"
+  echo "venv: $VENV_DIR ($(python --version 2>&1))"
+else
+  echo "aviso: venv não encontrado em '$VENV_DIR'; rode scripts/setup_env.sh antes" >&2
+fi
+
+echo "--- toolchain ---"
+nvcc --version
+
+# Arquitetura da GPU alocada: evita depender de -arch=native, que exige GPU visível no
+# momento da compilação e falha se o job for compilado em outro nó.
+COMPUTE_CAP="$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader | head -n1 | tr -d '.')"
+if [ -n "$COMPUTE_CAP" ]; then
+  CUDA_ARCH="sm_${COMPUTE_CAP}"
+else
+  CUDA_ARCH="sm_80"
+  echo "aviso: compute_cap não detectada, assumindo ${CUDA_ARCH}"
+fi
+echo "CUDA_ARCH: ${CUDA_ARCH}"
+
+# Cabeçalhos de RAFT/RMM: o Makefile os descobre nos wheels do venv ativo. Em ambiente
+# conda, exporte RAPIDS_INCLUDE=<prefixo>/include antes de submeter.
+#
+# LINK_RAFT=1 por padrão: é a configuração com a qual o link fecha neste cluster. Para
+# tentar largar libraft.so (e as nccl/cublas/cusolver/cusparse que ela arrasta), submeta
+# com --export=ALL,LINK_RAFT=0.
+MAKE_ARGS=(CUDA_ARCH="$CUDA_ARCH" LINK_RAFT="${LINK_RAFT:-1}")
+if [ -n "${RAPIDS_INCLUDE:-}" ]; then
+  MAKE_ARGS+=(RAPIDS_INCLUDE="$RAPIDS_INCLUDE")
+fi
+if [ -n "${CCCL_INCLUDE:-}" ]; then
+  MAKE_ARGS+=(CCCL_INCLUDE="$CCCL_INCLUDE")
+fi
+
+echo "--- cabeçalhos ---"
+make check-headers "${MAKE_ARGS[@]}"
+
+echo "--- build ---"
+make clean
+make "${MAKE_ARGS[@]}"
+
+# Os dois backends passam pelo mesmo selftest. Além de validar cada um, é validação
+# cruzada: são duas buscas de vizinhança independentes que têm de concordar nas mesmas
+# asserções exatas (3 clusters, monotonicidades, lotes idênticos ao lote único).
+echo "--- selftest: backend cuvs (o caminho do cuML) ---"
+./build/dbscan_multi --selftest --backend cuvs --json
+
+echo "--- selftest: backend codes (kernel próprio) ---"
+./build/dbscan_multi --selftest --backend codes --json
+
+echo "Finalizado em: $(date)"

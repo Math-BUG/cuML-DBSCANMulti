@@ -1,0 +1,12 @@
+# Ferramentas: geração de datasets, análise e testes.
+#
+# Mesmo conjunto usado em Math-BUG/SSCAD-2026 (cluster_ufv/requirements_cluster.txt),
+# para que os datasets gerados aqui sejam idênticos aos daquele trabalho.
+#
+# O baseline cuML fica em requirements-cuml.txt, instalado à parte por
+# scripts/setup_env.sh com INSTALL_CUML=1 — um venv só, duas etapas.
+numpy
+scikit-learn   # make_blobs/make_moons/make_circles, NearestNeighbors, adjusted_rand_score
+pandas
+matplotlib
+pytest

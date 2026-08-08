@@ -1,0 +1,71 @@
+cuML-DBSCANMulti
+Copyright (c) 2026 Universidade Federal de Viçosa (UFV)
+
+================================================================================
+Software de terceiros incluído neste repositório
+================================================================================
+
+Este produto inclui e deriva de software desenvolvido pela NVIDIA CORPORATION:
+
+    RAPIDS cuML — https://github.com/rapidsai/cuml
+    Copyright (c) 2018-2026, NVIDIA CORPORATION
+    Licenciado sob a Apache License, Version 2.0
+    Versão utilizada: tag v26.02.00, commit 22b12c8c3e378f17f35107f7fb4ffd65a3dce534
+
+Uma cópia não modificada do subconjunto utilizado (implementação do DBSCAN em
+`cpp/src/dbscan/` e cabeçalhos de apoio) está em `third_party/cuml/`, com os
+caminhos originais preservados e verificação de integridade em
+`third_party/cuml/VENDORED.md`. A licença Apache-2.0 correspondente está em
+`third_party/cuml/LICENSE`.
+
+Conforme a Apache License 2.0, seção 4(b), os arquivos derivados deste código que
+forem modificados neste projeto carregam um aviso de modificação em seu cabeçalho,
+além do aviso de copyright original da NVIDIA. A lista de arquivos modificados é
+mantida abaixo.
+
+--------------------------------------------------------------------------------
+Arquivos derivados do cuML e modificados neste projeto
+--------------------------------------------------------------------------------
+
+src/multi/corepoints_multi.cuh
+    Derivado de cpp/src/dbscan/corepoints/compute.cuh
+    Modificação: os graus de k raios são comparados contra l valores de minPts,
+    produzindo as k*l máscaras da grade em vez de uma única.
+
+src/multi/runner_multi.cuh
+    Derivado de cpp/src/dbscan/runner.cuh e cpp/src/dbscan/dbscan.cuh
+    Modificações: execução multiparamétrica na grade k x l (busca de vizinhança
+    compartilhada entre todas as configurações, CSR compartilhado entre os minPts de
+    cada ε); remoção dos caminhos RBC, multi-nó, sample_weight, Precomputed e Cosine;
+    estimativa de tamanho de lote passa a considerar k e l. A busca de vizinhança em si
+    não foi substituída: continua sendo a chamada do cuML ao cuVS.
+
+src/multi/vertexdeg_cuvs.cuh
+    Derivado de cpp/src/dbscan/vertexdeg/algo.cuh
+    Modificações: mantida apenas a chamada de força bruta com métrica L2 — a mesma que
+    o cuML faz ao cuVS; removidos RBC/ball_cover, sample_weight (e accumulateWeights),
+    métrica Cosine e o backend Precomputed.
+
+Arquivos novos, sem código derivado do cuML (copyright UFV, Apache-2.0):
+
+src/multi/csr_multi_eps.cuh       — anotação do CSR com o menor ε de cada entrada e
+                                    compactação por ε; é onde o multi-ε entra
+src/multi/eps_neighborhood.cuh    — backend alternativo de vizinhança, sem libcuvs
+src/multi/atomics.cuh             — atomicAdd para índice de 64 bits com sinal
+src/compat/cuml/common/logger.hpp — shim do logger, ver comentário no arquivo
+src/main.cu                       — executável de linha de comando
+
+================================================================================
+Dependências não incluídas neste repositório
+================================================================================
+
+Utilizadas em tempo de compilação/execução, obtidas do ecossistema RAPIDS e do
+CUDA Toolkit, sob suas próprias licenças:
+
+    RAFT      — https://github.com/rapidsai/raft      (Apache-2.0)
+    RMM       — https://github.com/rapidsai/rmm       (Apache-2.0)
+    CCCL/Thrust/CUB — NVIDIA CUDA Toolkit
+    cuVS      — https://github.com/rapidsai/cuvs      (Apache-2.0)
+
+O pacote Python `cuml` é utilizado como baseline de comparação nos experimentos,
+sem modificação.

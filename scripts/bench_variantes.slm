@@ -1,0 +1,185 @@
+#!/bin/bash
+#SBATCH --job-name=dbscanmulti_variantes
+#SBATCH --mail-type=ALL
+#SBATCH --mail-user=matheus.antony@ufv.br
+#SBATCH --partition=scientific
+#SBATCH --qos=scientific-qos
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=64G
+#SBATCH --gres=gpu:1
+#SBATCH --time=03:00:00
+#SBATCH --output=job_%j.out
+#SBATCH --error=job_%j.err
+
+# Mede as três variantes separadamente, e o ganho em função do número de configurações.
+#
+# Por que separar: as três compartilham coisas diferentes.
+#   - Multi-minPts (k=1): o grau de um ponto NÃO depende de minPts, então a busca de
+#     vizinhança inteira é compartilhada e só a rotulagem roda por configuração. É o teto.
+#   - Multi-EPS (l=1): compartilha a busca no maior raio, mas paga a anotação do CSR
+#     O(nnz·D) e uma compactação O(nnz) por raio.
+#   - Multi-Both: o produto dos dois.
+#
+# A varredura do número de configurações testa o modelo total = S + c·L: se ele valer, o
+# tempo cresce linearmente em c e o speedup satura em solo/L.
+#
+#   sbatch scripts/bench_variantes.slm
+#   sbatch --export=ALL,N=200000,NEIGH_PER_ROW=512 scripts/bench_variantes.slm
+
+set -euo pipefail
+
+echo "SLURM_JOB_ID: ${SLURM_JOB_ID:-unset}"
+echo "CUDA_VISIBLE_DEVICES: ${CUDA_VISIBLE_DEVICES:-unset}"
+echo "date: $(date)"
+
+module --force purge
+module load GCCcore/12.2.0
+module load CUDA/12.6.0
+export PYTHONNOUSERSITE=1
+export OPENBLAS_NUM_THREADS="${SLURM_CPUS_PER_TASK:-8}"
+export OMP_NUM_THREADS="${SLURM_CPUS_PER_TASK:-8}"
+export MKL_NUM_THREADS="${SLURM_CPUS_PER_TASK:-8}"
+
+PROJECT_DIR="${SLURM_SUBMIT_DIR:-$(pwd)}"
+cd "$PROJECT_DIR"
+
+VENV_DIR="${VENV_DIR:-.venv}"
+[ -f "$VENV_DIR/bin/activate" ] || { echo "erro: venv não encontrado em '$VENV_DIR'" >&2; exit 1; }
+# shellcheck disable=SC1090
+source "$VENV_DIR/bin/activate"
+
+# Datasets e resultados vao para a particao de dados (~/dados), nao para a HOME: a suite
+# completa passa de 2 GB, e mais ainda se entrarem N de 512k e 1M. Sobrepondo:
+#   sbatch --export=ALL,DATA_DIR=/outro/caminho ...
+DBM_BASE="${DBM_BASE:-$HOME/dados/dbscanmulti}"
+DATA_DIR="${DATA_DIR:-$DBM_BASE/data}"
+RESULTS_DIR="${RESULTS_DIR:-$DBM_BASE/results}"
+mkdir -p "$DATA_DIR" "$RESULTS_DIR"
+echo "dados:      $DATA_DIR"
+echo "resultados: $RESULTS_DIR"
+
+DATASET="${DATASET:-moons_16d}"
+N="${N:-100000}"
+REPEAT="${REPEAT:-5}"
+NEIGH_PER_ROW="${NEIGH_PER_ROW:-512}"
+INDEX="${INDEX:-auto}"
+
+COMPUTE_CAP="$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader | head -n1 | tr -d '.')"
+echo "--- build (sm_${COMPUTE_CAP:-80}) ---"
+make CUDA_ARCH="sm_${COMPUTE_CAP:-80}" LINK_RAFT="${LINK_RAFT:-1}"
+
+# Grade larga: 8 quantis de eps dão material para variar k até 8, e os minPts são
+# INTERPOLADOS dentro da faixa sugerida pelo gerador até dar 8 valores. Sem isso não dá
+# para comparar as variantes com o MESMO número de configurações, que é a única comparação
+# justa entre elas.
+#
+# Interpolar, e não extrapolar dobrando: minPts muito acima do grau típico jogaria todos os
+# pontos para ruído, e aí o weak_cc trabalha menos e o tempo daquela configuração sai
+# otimista — mediríamos a degeneração, não o algoritmo.
+META="$DATA_DIR/${DATASET}_n${N}.json"
+if [ ! -f "$META" ] || [ "${REGERAR:-0}" = "1" ]; then
+  echo "--- gerando ${DATASET} N=${N} com 8 quantis de eps ---"
+  python tools/gerar_datasets.py --dataset "$DATASET" --n "$N" --out-dir "$DATA_DIR" \
+    --eps-quantis 0.10,0.20,0.30,0.40,0.50,0.60,0.70,0.80 >/dev/null
+fi
+
+read -r EPS_ALL MINPTS_ALL <<EOF
+$(python - "$META" <<'PY'
+import json, sys
+m = json.load(open(sys.argv[1], encoding="utf-8"))
+eps = [f"{v:.10g}" for v in m["eps"]]
+mp = sorted(int(v) for v in m["min_samples"])
+
+# 8 valores em progressão geométrica entre o menor e o maior sugerido. Geométrica porque a
+# densidade de vizinhos cai com o raio de forma multiplicativa, não aditiva.
+lo, hi, k = mp[0], mp[-1], 8
+razao = (hi / lo) ** (1.0 / (k - 1))
+alvo = sorted({max(1, round(lo * razao ** i)) for i in range(k)})
+
+# Se o arredondamento colapsou valores, completa com inteiros ainda não usados.
+proximo = alvo[-1]
+while len(alvo) < k:
+    proximo += 1
+    alvo.append(proximo)
+
+print(",".join(eps), ",".join(str(v) for v in alvo))
+PY
+)
+EOF
+
+echo "eps disponíveis:    $EPS_ALL"
+echo "minPts disponíveis: $MINPTS_ALL"
+
+TAG="${DATASET}_n${N}_${SLURM_JOB_ID:-local}"
+
+fatia() { echo "$1" | cut -d, -f1-"$2"; }
+
+medir() {
+  local nome="$1" eps="$2" minpts="$3"
+  local saida="$RESULTS_DIR/var_${TAG}_${nome}.json"
+  echo ""
+  echo "=============== $nome  (eps=$eps  minPts=$minpts) ==============="
+  python tools/bench_vs_cuml.py \
+    --meta "$META" --eps "$eps" --min-samples "$minpts" \
+    --repeat "$REPEAT" --index "$INDEX" --neigh-per-row "$NEIGH_PER_ROW" \
+    --imposto --validar --out "$saida" \
+    | grep -vE "^\[.*CUML.*\]"
+}
+
+# --- as três variantes, com 8 configurações cada -----------------------------
+medir "multi_eps_8"     "$(fatia "$EPS_ALL" 8)" "$(fatia "$MINPTS_ALL" 1)"
+medir "multi_minpts_8"  "$(fatia "$EPS_ALL" 1)" "$(fatia "$MINPTS_ALL" 8)"
+medir "multi_both_2x4"  "$(fatia "$EPS_ALL" 2)" "$(fatia "$MINPTS_ALL" 4)"
+
+# --- ganho em função do número de configurações ------------------------------
+for c in 2 4 6; do
+  medir "eps_${c}"    "$(fatia "$EPS_ALL" $c)"    "$(fatia "$MINPTS_ALL" 1)"
+  medir "minpts_${c}" "$(fatia "$EPS_ALL" 1)"     "$(fatia "$MINPTS_ALL" $c)"
+done
+
+echo ""
+echo "=============== resumo ==============="
+python - "$RESULTS_DIR" "$TAG" <<'PY'
+import json, sys
+from pathlib import Path
+
+res_dir, tag = sys.argv[1], sys.argv[2]
+linhas = []
+for p in sorted(Path(res_dir).glob(f"var_{tag}_*.json")):
+    d = json.loads(p.read_text(encoding="utf-8"))
+    linhas.append((
+        p.stem.replace(f"var_{tag}_", ""),
+        len(d["eps"]), len(d["min_samples"]), d["configuration_count"],
+        d["multi_ms"], d["cuml_sequencial_ms"], d["speedup"],
+        d.get("ganho_multi_puro", float("nan")),
+        d.get("imposto_mediano", float("nan")),
+        d.get("particoes_identicas", -1),
+    ))
+
+print(f"{'variante':<16}{'k':>3}{'l':>3}{'cfg':>5}"
+      f"{'multi_ms':>11}{'cuml_seq_ms':>13}{'speedup':>9}{'ganho_puro':>12}"
+      f"{'T':>7}{'idênticas':>11}")
+for nome, k, l, c, mm, cs, sp, gp, t, ident in linhas:
+    print(f"{nome:<16}{k:>3}{l:>3}{c:>5}{mm:>11.1f}{cs:>13.1f}"
+          f"{sp:>8.2f}x{gp:>11.2f}x{t:>6.2f}x{ident:>8}/{c}")
+
+# Ajuste de S e L por variante-família, a partir dos pontos com c configurações.
+print("\nmodelo total = S + c*L (ms), por mínimos quadrados sobre os pontos de cada família:")
+for familia in ("eps", "minpts"):
+    pts = [(c, mm) for nome, k, l, c, mm, *_ in linhas if nome.startswith(familia + "_")]
+    if len(pts) < 2:
+        continue
+    n = len(pts)
+    sx = sum(c for c, _ in pts); sy = sum(m for _, m in pts)
+    sxx = sum(c * c for c, _ in pts); sxy = sum(c * m for c, m in pts)
+    den = n * sxx - sx * sx
+    L = (n * sxy - sx * sy) / den
+    S = (sy - L * sx) / n
+    print(f"  {familia:<8} S = {S:8.1f} ms   L = {L:6.2f} ms/config   "
+          f"teto do ganho = {(S + L) / L:5.1f}x")
+PY
+
+echo ""
+echo "Finalizado em: $(date)"
