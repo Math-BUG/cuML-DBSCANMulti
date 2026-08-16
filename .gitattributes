@@ -3,6 +3,9 @@
 
 # Vendored upstream sources: keep bytes identical to upstream for auditability
 third_party/** -text
+# Metadados locais (não são blobs upstream) devem permanecer legíveis e normalizados.
+third_party/cuml/VENDORED.md   text eol=lf
+third_party/cuml/VENDORED.json text eol=lf
 
 # Arquivos executados no cluster Linux: sempre LF, mesmo com core.autocrlf=true no
 # Windows. Com CRLF, o bash falha com "$'\r': command not found" e o make quebra nas

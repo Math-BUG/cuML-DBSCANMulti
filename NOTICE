@@ -1,6 +1,14 @@
 cuML-DBSCANMulti
 Copyright (c) 2026 Universidade Federal de Viçosa (UFV)
 
+STATUS DA LICENÇA DO PROJETO
+
+Este arquivo registra atribuições e avisos; ele não substitui uma licença. Em 2026-08-10
+os autores ainda não escolheram uma licença para o repositório como um todo. A licença em
+third_party/cuml/LICENSE e os identificadores SPDX aplicam-se aos arquivos que os declaram.
+A proveniência da fonte privada F2 também permanece sob revisão. Consulte
+docs/licenciamento-e-proveniencia.md antes de preparar uma release pública.
+
 ================================================================================
 Software de terceiros incluído neste repositório
 ================================================================================
@@ -34,11 +42,11 @@ src/multi/corepoints_multi.cuh
 
 src/multi/runner_multi.cuh
     Derivado de cpp/src/dbscan/runner.cuh e cpp/src/dbscan/dbscan.cuh
-    Modificações: execução multiparamétrica na grade k x l (busca de vizinhança
-    compartilhada entre todas as configurações, CSR compartilhado entre os minPts de
-    cada ε); remoção dos caminhos RBC, multi-nó, sample_weight, Precomputed e Cosine;
-    estimativa de tamanho de lote passa a considerar k e l. A busca de vizinhança em si
-    não foi substituída: continua sendo a chamada do cuML ao cuVS.
+    Modificações: execução multiparamétrica na grade k x l; no backend cuVS, seleção
+    adaptativa por lote entre anotar/compactar o CSR do maior ε e reconstruir um CSR por
+    ε em lote denso; CSR compartilhado entre os minPts de cada ε; remoção dos caminhos
+    RBC, multi-nó, sample_weight, Precomputed e Cosine; estimativa de lote considera k e
+    l. A busca cuVS em si continua sendo a chamada do cuML.
 
 src/multi/vertexdeg_cuvs.cuh
     Derivado de cpp/src/dbscan/vertexdeg/algo.cuh

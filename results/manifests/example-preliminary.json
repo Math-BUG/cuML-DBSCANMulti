@@ -1,0 +1,131 @@
+{
+  "$schema": "../../schemas/experiment-manifest.schema.json",
+  "schema_version": "1.2.0",
+  "experiment_id": "example-not-a-result",
+  "created_at": "2026-08-10T00:00:00-03:00",
+  "status": "preliminary",
+  "repository": {
+    "commit": "0000000000000000000000000000000000000000",
+    "dirty": true,
+    "remote": "https://github.com/Math-BUG/cuML-DBSCANMulti",
+    "tag": null
+  },
+  "upstream": {
+    "vendored_cuml_tag": "v26.02.00",
+    "vendored_cuml_commit": "22b12c8c3e378f17f35107f7fb4ffd65a3dce534",
+    "baseline_cuml_version": null,
+    "cupy_version": null,
+    "raft_version": null,
+    "rmm_version": null,
+    "cuvs_version": null
+  },
+  "environment": {
+    "gpu_model": null,
+    "driver_version": null,
+    "cuda_toolkit": null,
+    "compute_capability": null,
+    "python_version": null,
+    "compiler": null,
+    "build_command": null
+  },
+  "binary": {
+    "sha256": null,
+    "build_id": null,
+    "git_sha": null,
+    "git_dirty": null,
+    "configured_backend": null,
+    "compiled_backends": []
+  },
+  "dataset": {
+    "name": "example-dataset",
+    "n": 1,
+    "d": 1,
+    "seed": null,
+    "points_sha256": null,
+    "labels_sha256": null,
+    "metadata_sha256": null,
+    "generator_sha256": null,
+    "generation_method": null
+  },
+  "protocol": {
+    "backend": "cuvs",
+    "route_policy": "adaptive-per-batch",
+    "route_observed": "unknown",
+    "execution_stats_scope": "last_measured_repeat",
+    "index_requested": "auto",
+    "index_effective": "int32",
+    "neigh_per_row": 0,
+    "max_mbytes_per_batch": 0,
+    "batch_budget_protocol": {
+      "controlled_equal_request": false,
+      "requested_mbytes_each": null,
+      "multi_requested_bytes": null,
+      "multi_effective_bytes": null,
+      "multi_auto_policy": "80_percent_free_memory_with_reused_external_workspace",
+      "cuml_requested_bytes": null,
+      "cuml_effective_bytes": null,
+      "cuml_effective_observable": false,
+      "cuml_auto_policy": "cuml_default_80_percent_total_memory_minus_dataset"
+    },
+    "warmup": 1,
+    "repeat": 5,
+    "statistic": "median",
+    "precision": "float32",
+    "metric": "L2",
+    "config_order": "eps_major",
+    "eps": [0.1],
+    "min_samples": [5]
+  },
+  "measurements": {
+    "multi_ms": null,
+    "cuml_sequential_ms": null,
+    "speedup": null,
+    "multi_gain": null,
+    "overhead": null
+  },
+  "artifacts": {
+    "benchmark_json": null,
+    "stdout_log": null,
+    "stderr_log": null,
+    "labels": null,
+    "lockfile": null,
+    "validation_matrix": null
+  },
+  "validation": {
+    "validation_passed": false,
+    "semantic_oracle_run": false,
+    "backend_matrix_complete": false,
+    "compared_to_cuml": false,
+    "configuration_count": 1,
+    "semantic_valid_configurations": 0,
+    "oracle_random_seeds": 0,
+    "semantic_checks": {
+      "core_membership": false,
+      "core_components": false,
+      "noise": false,
+      "border_assignments": false
+    },
+    "exact_partitions": null,
+    "ari_minimum": null,
+    "noise_agreement_minimum": null,
+    "independent_runs": 0
+  },
+  "claims": {
+    "scope": "Exemplo de estrutura; não contém uma execução.",
+    "limitations": [
+      "Metadados nulos.",
+      "Artefatos ausentes.",
+      "Commit fictício composto por zeros."
+    ],
+    "generalizable": false
+  },
+  "publication": {
+    "ready": false,
+    "project_license_status": "unresolved",
+    "f2_provenance_status": "unresolved",
+    "blockers": [
+      "Este arquivo é somente um exemplo.",
+      "Licença e proveniência ainda não resolvidas."
+    ]
+  }
+}

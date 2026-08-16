@@ -1,12 +1,14 @@
-# Ferramentas: geração de datasets, análise e testes.
-#
-# Mesmo conjunto usado em Math-BUG/SSCAD-2026 (cluster_ufv/requirements_cluster.txt),
-# para que os datasets gerados aqui sejam idênticos aos daquele trabalho.
+# Dependências diretas realmente importadas pela geração de datasets, validação e testes.
+# O ambiente mais amplo de Math-BUG/SSCAD-2026 também tinha bibliotecas de relatório;
+# elas não são necessárias para produzir os mesmos datasets e não entram aqui.
 #
 # O baseline cuML fica em requirements-cuml.txt, instalado à parte por
 # scripts/setup_env.sh com INSTALL_CUML=1 — um venv só, duas etapas.
+#
+# Este arquivo declara somente dependências diretas. As versões históricas exatas de
+# NumPy/scikit-learn/pytest não foram preservadas, portanto não se inventam pins
+# retrospectivos. Antes de citar uma execução, gere no cluster e versione o
+# requirements.lock.txt completo; ele é a fonte autoritativa para transitivas.
 numpy
 scikit-learn   # make_blobs/make_moons/make_circles, NearestNeighbors, adjusted_rand_score
-pandas
-matplotlib
 pytest

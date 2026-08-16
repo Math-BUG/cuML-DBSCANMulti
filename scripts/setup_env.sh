@@ -25,8 +25,37 @@ set -euo pipefail
 
 VENV_DIR="${VENV_DIR:-.venv}"
 INSTALL_CUML="${INSTALL_CUML:-0}"
+USE_LOCK="${USE_LOCK:-0}"
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJECT_DIR"
+
+# O /tmp dos nós do cluster é compartilhado e pode estar cheio. Downloads, wheels e
+# arquivos intermediários do pip ficam na partição de dados por padrão.
+DBM_SETUP_STORAGE="${DBM_SETUP_STORAGE:-$HOME/dados/dbscanmulti/setup}"
+export TMPDIR="${DBM_SETUP_TMPDIR:-$DBM_SETUP_STORAGE/tmp}"
+export PIP_CACHE_DIR="${DBM_PIP_CACHE_DIR:-$DBM_SETUP_STORAGE/pip-cache}"
+mkdir -p "$TMPDIR" "$PIP_CACHE_DIR"
+
+# `criar_venv` remove o diretório antes de tentar novamente. Resolva e valide uma vez,
+# antes de qualquer rm, para que VENV_DIR vazio, '/', '.', '..' ou a raiz do projeto nunca
+# possa apagar uma árvore ampla por engano.
+VENV_DIR="$(realpath -m -- "$VENV_DIR")"
+case "$VENV_DIR" in
+  ""|/|"$PROJECT_DIR"|"$(dirname "$PROJECT_DIR")")
+    echo "erro: VENV_DIR inseguro: '$VENV_DIR'" >&2
+    exit 2
+    ;;
+esac
+if [ "$(dirname "$VENV_DIR")" = "$VENV_DIR" ]; then
+  echo "erro: VENV_DIR resolve para uma raiz de sistema: '$VENV_DIR'" >&2
+  exit 2
+fi
+case "$PROJECT_DIR/" in
+  "$VENV_DIR/"*)
+    echo "erro: VENV_DIR '$VENV_DIR' é ancestral do repositório '$PROJECT_DIR'" >&2
+    exit 2
+    ;;
+esac
 
 # Impede que o venv enxergue ~/.local/lib/pythonX.Y/site-packages. Sem isso, pacotes
 # antigos da HOME (torch, numpy desatualizado) vazam para dentro do venv e quebram a
@@ -40,6 +69,8 @@ unset PYTHONHOME PYTHONPATH
 
 echo "projeto: $PROJECT_DIR"
 echo "venv:    $VENV_DIR"
+echo "tmp:     $TMPDIR"
+echo "pip cache: $PIP_CACHE_DIR"
 echo "python:  $(command -v python3) ($(python3 --version 2>&1))"
 
 # --- criação do venv ---------------------------------------------------------
@@ -47,9 +78,17 @@ echo "python:  $(command -v python3) ($(python3 --version 2>&1))"
 # arquivos da HOME, ensurepip quebrado, cota estourada, ou um venv anterior interrompido
 # pela metade. O sintoma costuma ser sempre o mesmo e pouco informativo:
 #   Error: [Errno 2] No such file or directory: '.../.venv/bin/python3'
-# Por isso: sempre recriar do zero e tentar as variantes em ordem.
+# Por isso, quando a recriação é necessária, remover de forma controlada e tentar as
+# variantes em ordem. Um venv sadio só é recriado com RECREATE_VENV=1.
+VENV_CRIADO_NESTA_EXECUCAO=0
 criar_venv() {
-  rm -rf "$VENV_DIR"
+  if [ -e "$VENV_DIR" ] && [ ! -f "$VENV_DIR/pyvenv.cfg" ] &&
+     [ "$VENV_CRIADO_NESTA_EXECUCAO" != 1 ]; then
+    echo "erro: recuso remover '$VENV_DIR': diretório existente não parece um virtualenv" >&2
+    return 2
+  fi
+  rm -rf -- "$VENV_DIR"
+  VENV_CRIADO_NESTA_EXECUCAO=1
   python3 -m venv "$@" "$VENV_DIR" >/dev/null 2>&1 && [ -x "$VENV_DIR/bin/python" ]
 }
 
@@ -104,22 +143,42 @@ module load GCCcore/12.2.0
 module load CUDA/12.6.0
 unset PYTHONHOME PYTHONPATH
 
-python -m pip install --upgrade pip setuptools wheel
-
-echo "--- etapa 1/2: ferramentas (datasets, análise, testes) ---"
-python -m pip install -r requirements.txt
-python -c "import numpy, pandas, sklearn, matplotlib; print('deps basicas ok')"
-
-if [ "$INSTALL_CUML" = "1" ]; then
-  echo "--- etapa 2/2: RAPIDS (baseline cuML) — download grande, alguns minutos ---"
-  python -m pip install -r requirements-cuml.txt
-  python -c "import cupy; from cuml.cluster import DBSCAN; print('cuml ok')"
+if [ "$VENV_CRIADO_NESTA_EXECUCAO" = 1 ]; then
+  python -m pip install --upgrade pip setuptools wheel
 else
-  echo "--- etapa 2/2: RAPIDS pulado (use INSTALL_CUML=1 para instalar o baseline) ---"
+  # Num venv existente, instalar só o que faltar. `--upgrade` baixava uma nova versão de
+  # setuptools a cada execução, antes mesmo de chegar à dependência realmente ausente.
+  python -m pip install pip setuptools wheel
 fi
 
-python -m pip freeze > "$PROJECT_DIR/requirements.lock.txt"
-echo "versões exatas registradas em requirements.lock.txt"
+if [ "$USE_LOCK" = "1" ]; then
+  if [ ! -s requirements.lock.txt ]; then
+    echo "erro: USE_LOCK=1 exige requirements.lock.txt versionado e não vazio" >&2
+    exit 2
+  fi
+  echo "--- instalando ambiente congelado por requirements.lock.txt ---"
+  python -m pip install --extra-index-url https://pypi.nvidia.com -r requirements.lock.txt
+else
+  echo "--- etapa 1/2: ferramentas (datasets, análise, testes) ---"
+  python -m pip install -r requirements.txt
+  python -c "import numpy, pytest, sklearn; print('deps basicas e testes ok')"
+
+  if [ "$INSTALL_CUML" = "1" ]; then
+    echo "--- etapa 2/2: RAPIDS (baseline cuML) — download grande, alguns minutos ---"
+    python -m pip install -r requirements-cuml.txt
+    python -c "import cupy, rapids_logger; from cuml.cluster import DBSCAN; print('cuml e rapids_logger ok')"
+  else
+    echo "--- etapa 2/2: RAPIDS pulado (use INSTALL_CUML=1 para instalar o baseline) ---"
+  fi
+fi
+
+if [ "$USE_LOCK" = "1" ]; then
+  python -m pip freeze --all | diff -u requirements.lock.txt -
+  echo "ambiente confere exatamente com requirements.lock.txt"
+else
+  python -m pip freeze --all > "$PROJECT_DIR/requirements.lock.txt"
+  echo "versões exatas registradas em requirements.lock.txt; revise e versione o arquivo"
+fi
 
 # --- cabeçalhos de RAFT/RMM para compilar o binário --------------------------
 # Vêm dos wheels lib* quando o RAPIDS está instalado; senão, extraídos direto dos

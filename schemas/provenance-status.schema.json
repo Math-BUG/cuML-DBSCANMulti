@@ -1,0 +1,68 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/Math-BUG/cuML-DBSCANMulti/schemas/provenance-status.schema.json",
+  "title": "cuML-DBSCANMulti provenance status",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "reviewed_at", "publication_ready", "project_license", "sources", "blockers"],
+  "properties": {
+    "$schema": {"type": "string"},
+    "schema_version": {"const": "1.0.0"},
+    "reviewed_at": {"type": "string", "format": "date"},
+    "publication_ready": {"type": "boolean"},
+    "project_license": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "root_license_file", "note"],
+      "properties": {
+        "status": {"enum": ["unresolved", "resolved"]},
+        "root_license_file": {"type": ["string", "null"]},
+        "note": {"type": "string", "minLength": 1}
+      }
+    },
+    "sources": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "name", "status", "license", "evidence", "note"],
+        "properties": {
+          "id": {"type": "string", "minLength": 1},
+          "name": {"type": "string", "minLength": 1},
+          "status": {"enum": ["resolved", "unresolved", "review-required", "not-included"]},
+          "license": {"type": ["string", "null"]},
+          "evidence": {"type": "string", "minLength": 1},
+          "note": {"type": "string", "minLength": 1}
+        }
+      }
+    },
+    "blockers": {
+      "type": "array",
+      "items": {"type": "string", "minLength": 1}
+    }
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"publication_ready": {"const": true}}},
+      "then": {
+        "properties": {
+          "project_license": {
+            "properties": {
+              "status": {"const": "resolved"},
+              "root_license_file": {"type": "string", "minLength": 1}
+            }
+          },
+          "blockers": {"maxItems": 0},
+          "sources": {
+            "items": {
+              "properties": {
+                "status": {"enum": ["resolved", "not-included"]}
+              }
+            }
+          }
+        }
+      }
+    }
+  ]
+}

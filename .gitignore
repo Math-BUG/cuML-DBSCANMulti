@@ -1,13 +1,26 @@
 build/
-# Baixado por scripts/fetch_rapids_headers.sh (~50 MB de cabeçalhos)
+# Cabeçalhos/bibliotecas extraídos dos wheels por scripts/fetch_rapids_headers.sh
 third_party/rapids_headers/
-results/
+# Resultados brutos continuam locais; manifests/resumos pequenos e revisados são
+# versionáveis para ligar alegações a artefatos externos por SHA-256.
+results/*
+!results/README.md
+!results/manifests/
+!results/manifests/*.json
+!results/summaries/
+!results/summaries/*.json
+!results/summaries/*.csv
 data/
 *.f32
 *.i32
 job_*.out
 job_*.err
+validation_failures/
+.pytest_cache/
+pytest-cache-files-*/
+tests_tmp*/
 .venv/
 # requirements.lock.txt NÃO é ignorado de propósito: é o registro das versões exatas
 # usadas nos experimentos, gerado por scripts/setup_env.sh no cluster.
+!requirements.lock.txt
 __pycache__/

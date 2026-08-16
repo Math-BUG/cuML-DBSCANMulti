@@ -12,8 +12,9 @@
  *
  * Como funciona: este arquivo é encontrado antes do original porque `src/compat` vem
  * primeiro na ordem dos `-I` (ver Makefile). Os `#include <cuml/common/logger.hpp>`
- * dos arquivos vendorizados resolvem para cá, e nem logger_macros.hpp nem rapids_logger
- * entram no build.
+ * dos arquivos vendorizados resolvem para cá, e `logger_macros.hpp` não entra no build.
+ * O RAFT, porém, inclui `rapids_logger/log_levels.h` por seus próprios headers; essa
+ * dependência transitiva permanece no Makefile e não é substituída por este shim.
  *
  * As macros são no-ops por padrão. Compile com -DDBSCANMULTI_VERBOSE_LOG para ligar as
  * mensagens no stderr — útil para depurar tamanho de lote, nnz por lote e número de

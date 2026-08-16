@@ -1,7 +1,5 @@
 #!/bin/bash
 #SBATCH --job-name=dbscanmulti_check
-#SBATCH --mail-type=ALL
-#SBATCH --mail-user=matheus.antony@ufv.br
 #SBATCH --partition=scientific
 #SBATCH --qos=scientific-qos
 #SBATCH --nodes=1
@@ -48,14 +46,22 @@ PROJECT_DIR="${SLURM_SUBMIT_DIR:-$(pwd)}"
 cd "$PROJECT_DIR"
 echo "project_dir: $(pwd)"
 
+# /tmp é compartilhado e pode lotar durante o pré-processamento do nvcc.
+# shellcheck disable=SC1091
+source scripts/setup_job_tmp.sh
+
 VENV_DIR="${VENV_DIR:-.venv}"
-if [ -f "$VENV_DIR/bin/activate" ]; then
-  # shellcheck disable=SC1090
-  source "$VENV_DIR/bin/activate"
-  echo "venv: $VENV_DIR ($(python --version 2>&1))"
-else
-  echo "aviso: venv não encontrado em '$VENV_DIR'; rode scripts/setup_env.sh antes" >&2
+if [ ! -f "$VENV_DIR/bin/activate" ]; then
+  echo "erro: venv não encontrado em '$VENV_DIR'; rode INSTALL_CUML=1 bash scripts/setup_env.sh" >&2
+  exit 1
 fi
+# shellcheck disable=SC1090
+source "$VENV_DIR/bin/activate"
+echo "venv: $VENV_DIR ($(python --version 2>&1))"
+python -c 'import cupy, rapids_logger; from cuml.cluster import DBSCAN' 2>/dev/null || {
+  echo "erro: CuPy/cuML ausentes no venv; rode INSTALL_CUML=1 bash scripts/setup_env.sh" >&2
+  exit 1
+}
 
 echo "--- toolchain ---"
 nvcc --version
@@ -77,7 +83,7 @@ echo "CUDA_ARCH: ${CUDA_ARCH}"
 # LINK_RAFT=1 por padrão: é a configuração com a qual o link fecha neste cluster. Para
 # tentar largar libraft.so (e as nccl/cublas/cusolver/cusparse que ela arrasta), submeta
 # com --export=ALL,LINK_RAFT=0.
-MAKE_ARGS=(CUDA_ARCH="$CUDA_ARCH" LINK_RAFT="${LINK_RAFT:-1}")
+MAKE_ARGS=(CUDA_ARCH="$CUDA_ARCH" STD="${STD:-c++17}" LINK_RAFT="${LINK_RAFT:-1}")
 if [ -n "${RAPIDS_INCLUDE:-}" ]; then
   MAKE_ARGS+=(RAPIDS_INCLUDE="$RAPIDS_INCLUDE")
 fi
@@ -85,20 +91,88 @@ if [ -n "${CCCL_INCLUDE:-}" ]; then
   MAKE_ARGS+=(CCCL_INCLUDE="$CCCL_INCLUDE")
 fi
 
-echo "--- cabeçalhos ---"
-make check-headers "${MAKE_ARGS[@]}"
+CUVS_ARGS=("${MAKE_ARGS[@]}" BACKEND=cuvs)
+CODES_ARGS=("${MAKE_ARGS[@]}" BACKEND=codes)
 
-echo "--- build ---"
-make clean
-make "${MAKE_ARGS[@]}"
+echo "--- build: backend cuvs (o caminho do cuML) ---"
+make "${CUVS_ARGS[@]}"
+CUVS_BIN="$(make --no-print-directory -s print-target "${CUVS_ARGS[@]}")"
 
-# Os dois backends passam pelo mesmo selftest. Além de validar cada um, é validação
-# cruzada: são duas buscas de vizinhança independentes que têm de concordar nas mesmas
-# asserções exatas (3 clusters, monotonicidades, lotes idênticos ao lote único).
-echo "--- selftest: backend cuvs (o caminho do cuML) ---"
-./build/dbscan_multi --selftest --backend cuvs --json
+echo "--- build: backend codes (sem cuVS) ---"
+make "${CODES_ARGS[@]}"
+CODES_BIN="$(make --no-print-directory -s print-target "${CODES_ARGS[@]}")"
 
-echo "--- selftest: backend codes (kernel próprio) ---"
-./build/dbscan_multi --selftest --backend codes --json
+echo "binario cuvs:  $CUVS_BIN"
+echo "binario codes: $CODES_BIN"
+
+# Tudo abaixo preserva suas saidas em build/ para que uma falha no job seja reproduzivel.
+VALIDATION_DIR="${VALIDATION_DIR:-${BUILD_DIR:-build}/check_gpu_${SLURM_JOB_ID:-local}}"
+mkdir -p "$VALIDATION_DIR"
+
+echo "--- hash + build-info + manifesto ---"
+python scripts/check_binary_identity.py --binary "$CUVS_BIN" \
+  --backend cuvs --cuda-arch "$CUDA_ARCH" --require-identified \
+  > "$VALIDATION_DIR/identity-cuvs.json"
+python scripts/check_binary_identity.py --binary "$CODES_BIN" \
+  --backend codes --cuda-arch "$CUDA_ARCH" --require-identified \
+  > "$VALIDATION_DIR/identity-codes.json"
+
+# O alvo selftest repete a atestacao imediatamente antes de executar o binario.
+echo "--- selftest: backend cuvs ---"
+make selftest "${CUVS_ARGS[@]}"
+echo "--- selftest: backend codes ---"
+make selftest "${CODES_ARGS[@]}"
+
+expect_cli_failure() {  # $1=nome; os demais argumentos vao para o binario codes
+  local name="$1" status
+  shift
+  set +e
+  "$CODES_BIN" "$@" >"$VALIDATION_DIR/cli-${name}.out" \
+                     2>"$VALIDATION_DIR/cli-${name}.err"
+  status=$?
+  set -e
+  if [ "$status" -ne 2 ]; then
+    echo "erro: caso CLI '$name' retornou $status; esperado 2" >&2
+    exit 1
+  fi
+  if [ ! -s "$VALIDATION_DIR/cli-${name}.err" ]; then
+    echo "erro: caso CLI '$name' falhou sem diagnostico em stderr" >&2
+    exit 1
+  fi
+  echo "  ok: $name rejeitado com exit 2"
+}
+
+echo "--- validacao negativa da CLI ---"
+CLI_BASE=(--input /dev/null --n 1 --d 1 --backend codes)
+expect_cli_failure min-samples-zero "${CLI_BASE[@]}" --eps 1 --min-samples 0
+expect_cli_failure eps-nan "${CLI_BASE[@]}" --eps nan --min-samples 1
+expect_cli_failure max-mbytes-negativo "${CLI_BASE[@]}" --eps 1 --min-samples 1 \
+  --max-mbytes-per-batch -1
+expect_cli_failure neigh-per-row-negativo "${CLI_BASE[@]}" --eps 1 --min-samples 1 \
+  --neigh-per-row -1
+
+echo "--- matriz reduzida cuvs x codes x cuML x oraculo ---"
+# O build cuvs contem as duas rotas compiladas; por isso a matriz usa somente CUVS_BIN.
+# stdout/stderr e artefatos de divergencia ficam preservados mesmo quando o gate falha.
+MATRIX_STDOUT="$VALIDATION_DIR/validation-matrix.stdout.jsonl"
+MATRIX_STDERR="$VALIDATION_DIR/validation-matrix.stderr.log"
+set +e
+python tools/run_validation_matrix.py \
+  --binary "$CUVS_BIN" \
+  --random-seeds "${MATRIX_RANDOM_SEEDS:-3}" \
+  --repetitions "${MATRIX_REPETITIONS:-2}" \
+  --falhas-dir "$VALIDATION_DIR/falhas-matrix" \
+  --out "$VALIDATION_DIR/validation-matrix.json" \
+  > "$MATRIX_STDOUT" 2> "$MATRIX_STDERR"
+MATRIX_STATUS=$?
+set -e
+if [ "$MATRIX_STATUS" -ne 0 ]; then
+  cat "$MATRIX_STDERR" >&2
+  echo "erro: matriz retornou $MATRIX_STATUS; artefatos em $VALIDATION_DIR" >&2
+  exit "$MATRIX_STATUS"
+fi
+cat "$MATRIX_STDOUT"
+
+echo "artefatos de validacao: $VALIDATION_DIR"
 
 echo "Finalizado em: $(date)"

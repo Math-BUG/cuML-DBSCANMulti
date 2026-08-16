@@ -2,16 +2,19 @@
 """
 Gera os datasets sintéticos e a grade de parâmetros do cuML-DBSCANMulti.
 
-Os geradores são uma adaptação fiel de cluster_ufv/datasets_sinteticos.py do repositório
-Math-BUG/SSCAD-2026, para que os conjuntos de dados produzidos aqui sejam os MESMOS
-daquele trabalho — famílias, sementes, normalização e heurísticas de parâmetro. Sem isso
-os tempos medidos não seriam comparáveis com os números publicados.
+Os geradores partem de cluster_ufv/datasets_sinteticos.py do repositório
+Math-BUG/SSCAD-2026 e preservam famílias, sementes e normalização. A heurística de eps
+foi corrigida aqui para ajustar o posto do kNN quando N excede a amostra de 60 mil pontos;
+por isso datasets/grades novos com N > 60 mil pertencem a um protocolo novo e não devem
+ser misturados com os resultados históricos.
 
-Diferenças em relação ao original, todas de formato de saída:
+Diferenças em relação ao original:
   - grava .f32 binário row-major, que é o que o executável CUDA lê;
   - grava um .json com N, D, semente e a grade (eps, minPts) já calculada, para alimentar
     tanto o nosso binário quanto o baseline cuML com exatamente os mesmos parâmetros;
   - sem matplotlib: geração é headless, gráficos ficam para a etapa de análise.
+  - para N > 60 mil, corrige o posto amostral do kNN usado para sugerir eps e registra o
+    método no metadata.
 
 Uso:
     python tools/gerar_datasets.py --dataset moons_16d --n 100000 --out-dir data
@@ -27,9 +30,13 @@ Saída por dataset, em --out-dir:
 from __future__ import annotations
 
 import argparse
+import hashlib
+import importlib.metadata
 import json
 import os
+import platform
 import re
+import sys
 from pathlib import Path
 
 
@@ -61,6 +68,9 @@ from sklearn.datasets import make_blobs, make_circles, make_moons  # noqa: E402
 from sklearn.neighbors import NearestNeighbors  # noqa: E402
 
 SEED = 42
+# Identificador obrigatório nos metadados da campanha corrigida. Arquivos históricos não
+# possuem este campo e são recusados pelos jobs mesmo se DATA_DIR apontar para eles.
+DATASET_PROTOCOL = "knn-sample-rank-v2"
 
 # Famílias usadas no artigo. As demais do catálogo original continuam disponíveis por
 # nome, mas não entram na suíte padrão.
@@ -138,6 +148,12 @@ def _augmentar_2d_para_dim(X2, target_dim, rng, ruido=0.025):
     """
     X2 = np.asarray(X2, dtype=np.float32)
     target_dim = int(target_dim)
+    if target_dim < 1:
+        raise ValueError("target_dim precisa ser >= 1")
+    if X2.ndim != 2 or X2.shape[1] != 2:
+        raise ValueError("X2 precisa ter exatamente duas colunas")
+    if target_dim == 1:
+        return np.ascontiguousarray(X2[:, :1], dtype=np.float32)
     if target_dim == 2:
         return X2
 
@@ -349,8 +365,15 @@ def make_synthetic_dataset(name, n_samples, seed=SEED):
         n_cluster = 8
         pesos = np.asarray([1.0 / (i + 1) ** 1.2 for i in range(n_cluster)])
         pesos /= pesos.sum()
-        tam = [max(4, int(p * n_samples)) for p in pesos]
-        tam[0] += n_samples - sum(tam)
+        # Uma amostra por cluster é o único mínimo possível para N=8. O restante é
+        # distribuído pela lei de potência; assim os tamanhos são sempre positivos e
+        # somam exatamente N, inclusive nos smokes pequenos.
+        restantes = n_samples - n_cluster
+        tam = np.ones(n_cluster, dtype=np.int64)
+        extras = np.floor(pesos * restantes).astype(np.int64)
+        tam += extras
+        tam[0] += restantes - int(extras.sum())
+        tam = [int(v) for v in tam]
 
         centers = _centers_for_dim(dim, count=n_cluster, scale=5.0)
         X, y = make_blobs(n_samples=tam, centers=centers, cluster_std=0.20,
@@ -511,7 +534,7 @@ def sugerir_minpts(X, sample_size=5000, minpts_max=256, seed=SEED):
 
 
 def sugerir_eps_por_knn(X, min_pts, quantis=(0.50, 0.70, 0.85), max_pontos=60000, seed=SEED,
-                        y=None):
+                        y=None, return_info=False):
     """
     Candidatos de eps por quantis da curva k-distance — versão automatizada do
     "k-distance plot" clássico, sem depender de leitura visual do cotovelo.
@@ -534,7 +557,18 @@ def sugerir_eps_por_knn(X, min_pts, quantis=(0.50, 0.70, 0.85), max_pontos=60000
     X = np.asarray(X, dtype=np.float32)
     idx = _indices_amostrados(X.shape[0], max_pontos, seed)
     Xs = X[idx]
-    k_eff = int(min(max(2, int(min_pts)), Xs.shape[0]))
+
+    # Se N excede a amostra, usar o mesmo minPts dentro de Xs infla o raio: o k-ésimo
+    # vizinho de 60k pontos passa a conter aproximadamente k*N/60k vizinhos no conjunto
+    # completo. Ajustamos o posto pela fração amostral para estimar a distância que teria
+    # `min_pts` no dataset inteiro. Isso mantém a densidade comparável sem materializar
+    # distâncias entre até 60k consultas e um milhão de referências.
+    if X.shape[0] <= 1 or Xs.shape[0] <= 1:
+        k_eff = 1
+    else:
+        fracao = (Xs.shape[0] - 1) / (X.shape[0] - 1)
+        k_eff = 1 + int(round(max(0, int(min_pts) - 1) * fracao))
+        k_eff = int(np.clip(k_eff, 2, Xs.shape[0]))
 
     nn = NearestNeighbors(n_neighbors=k_eff, algorithm="auto", n_jobs=N_THREADS)
     nn.fit(Xs)
@@ -549,15 +583,61 @@ def sugerir_eps_por_knn(X, min_pts, quantis=(0.50, 0.70, 0.85), max_pontos=60000
 
     kth = np.sort(kth)
     eps_values = np.asarray([np.quantile(kth, q) for q in quantis], dtype=np.float32)
-    return np.unique(np.maximum(eps_values, np.float32(1e-6))).astype(np.float32)
+    eps_values = np.unique(np.maximum(eps_values, np.float32(1e-6))).astype(np.float32)
+    info = {
+        "metodo": "k-distance em amostra com posto corrigido pela fracao amostral",
+        "populacao": int(X.shape[0]),
+        "amostra": int(Xs.shape[0]),
+        "min_pts_populacao": int(min_pts),
+        "k_amostral": int(k_eff),
+    }
+    return (eps_values, info) if return_info else eps_values
 
 
-def sugerir_grade(X, quantis=(0.50, 0.70, 0.85), seed=SEED, y=None):
+def sugerir_grade(X, quantis=(0.50, 0.70, 0.85), seed=SEED, y=None, return_info=False):
     """Grade completa (eps, minPts): 3 x 4 = 12 configurações, como no artigo."""
     minpts_values, dim_int = sugerir_minpts(X, seed=seed)
     min_pts_ref = int(minpts_values[len(minpts_values) // 2])
-    eps_values = sugerir_eps_por_knn(X, min_pts_ref, quantis=quantis, seed=seed, y=y)
-    return eps_values, minpts_values, min_pts_ref, dim_int
+    eps_values, eps_info = sugerir_eps_por_knn(
+        X, min_pts_ref, quantis=quantis, seed=seed, y=y, return_info=True)
+    result = (eps_values, minpts_values, min_pts_ref, dim_int)
+    return result + (eps_info,) if return_info else result
+
+
+def sha256_file(path, chunk_size=1024 * 1024):
+    """SHA-256 streaming para ligar metadados às entradas binárias exatas."""
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as stream:
+        for chunk in iter(lambda: stream.read(chunk_size), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def validar_meta_protocolo(path, dataset=None, n=None, eps_quantis=None, eps_count=None):
+    """Valida que um metadata pertence inequivocamente ao protocolo corrente."""
+    path = Path(path)
+    meta = json.loads(path.read_text(encoding="utf-8"))
+    if meta.get("protocolo_dataset") != DATASET_PROTOCOL:
+        raise ValueError(
+            f"metadata legado ou incompatível: protocolo_dataset deve ser "
+            f"{DATASET_PROTOCOL!r}; gere a nova campanha em um diretório vazio "
+            "e preserve os dados históricos"
+        )
+    if dataset is not None and meta.get("dataset") != dataset:
+        raise ValueError(f"dataset divergente: esperado {dataset!r}, obtido {meta.get('dataset')!r}")
+    if n is not None and meta.get("n") != n:
+        raise ValueError(f"N divergente: esperado {n}, obtido {meta.get('n')!r}")
+    if eps_count is not None and len(meta.get("eps", [])) != eps_count:
+        raise ValueError(
+            f"grade eps incompatível: esperados {eps_count} valores, "
+            f"obtidos {len(meta.get('eps', []))}"
+        )
+    if eps_quantis is not None:
+        observed = tuple(float(value) for value in meta.get("quantis_eps", []))
+        expected = tuple(float(value) for value in eps_quantis)
+        if observed != expected:
+            raise ValueError(f"quantis_eps divergentes: esperado {expected}, obtido {observed}")
+    return meta
 
 
 # =============================================================================
@@ -573,16 +653,20 @@ def gerar_e_gravar(nome, n_samples, out_dir, seed=SEED, quantis=(0.50, 0.70, 0.8
     X = np.ascontiguousarray(X, dtype=np.float32)
     y = np.ascontiguousarray(y, dtype=np.int32)
 
-    eps_values, minpts_values, min_pts_ref, dim_int = sugerir_grade(X, quantis, seed, y=y)
+    eps_values, minpts_values, min_pts_ref, dim_int, eps_info = sugerir_grade(
+        X, quantis, seed, y=y, return_info=True)
 
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     base = out_dir / f"{nome}_n{X.shape[0]}"
 
-    X.tofile(f"{base}.f32")
-    y.tofile(f"{base}.labels.i32")
+    points_path = Path(f"{base}.f32")
+    labels_path = Path(f"{base}.labels.i32")
+    X.tofile(points_path)
+    y.tofile(labels_path)
 
     meta = {
+        "protocolo_dataset": DATASET_PROTOCOL,
         "dataset": nome,
         "descricao": desc,
         "n": int(X.shape[0]),
@@ -594,6 +678,7 @@ def gerar_e_gravar(nome, n_samples, out_dir, seed=SEED, quantis=(0.50, 0.70, 0.8
         "dimensao_intrinseca": round(float(dim_int), 4),
         "min_pts_referencia": int(min_pts_ref),
         "quantis_eps": list(quantis),
+        "estimativa_eps": eps_info,
         # A grade já sai ordenada: pré-condição dos Algoritmos 2 e 3 e do nosso binário.
         "eps": [float(v) for v in eps_values],
         "min_samples": [int(v) for v in minpts_values],
@@ -602,6 +687,17 @@ def gerar_e_gravar(nome, n_samples, out_dir, seed=SEED, quantis=(0.50, 0.70, 0.8
         "arquivos": {
             "points": f"{base.name}.f32",
             "labels_verdadeiros": f"{base.name}.labels.i32",
+        },
+        "sha256": {
+            "points": sha256_file(points_path),
+            "labels_verdadeiros": sha256_file(labels_path),
+            "gerador": sha256_file(Path(__file__).resolve()),
+        },
+        "ambiente_geracao": {
+            "python": platform.python_version(),
+            "numpy": np.__version__,
+            "scikit_learn": importlib.metadata.version("scikit-learn"),
+            "plataforma": platform.platform(),
         },
     }
     Path(f"{base}.json").write_text(json.dumps(meta, indent=2, ensure_ascii=False),
@@ -633,11 +729,37 @@ def main():
                         "padrão é estreito de propósito (três valores dentro de ~20%%), o "
                         "que dá agrupamentos parecidos entre si. Para uma grade que "
                         "realmente varra a faixa, algo como 0.2,0.4,0.6,0.8 separa mais.")
+    p.add_argument("--validar-meta", metavar="ARQUIVO",
+                   help="recusa metadata legado/incompatível sem alterar os dados")
+    p.add_argument("--esperar-eps-count", type=int,
+                   help="com --validar-meta, exige esta quantidade de valores de eps")
+    p.add_argument("--esperar-eps-quantis",
+                   help="com --validar-meta, exige exatamente estes quantis")
     args = p.parse_args()
 
     quantis = tuple(float(q) for q in args.eps_quantis.split(",") if q.strip())
     if not quantis or any(not 0.0 < q < 1.0 for q in quantis):
         p.error("--eps-quantis deve ser uma lista de valores em (0, 1)")
+
+    if args.validar_meta:
+        expected_quantiles = None
+        if args.esperar_eps_quantis:
+            expected_quantiles = tuple(
+                float(q) for q in args.esperar_eps_quantis.split(",") if q.strip()
+            )
+        try:
+            validar_meta_protocolo(
+                args.validar_meta,
+                dataset=args.dataset,
+                n=args.n,
+                eps_quantis=expected_quantiles,
+                eps_count=args.esperar_eps_count,
+            )
+        except (OSError, ValueError, KeyError, json.JSONDecodeError) as exc:
+            print(f"erro: {exc}", file=sys.stderr)
+            return 2
+        print(f"ok: metadata {args.validar_meta} usa {DATASET_PROTOCOL}")
+        return 0
 
     if args.listar:
         print("famílias do artigo (suíte padrão):")

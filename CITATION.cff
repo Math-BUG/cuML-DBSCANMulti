@@ -1,0 +1,16 @@
+cff-version: 1.2.0
+message: >-
+  If you use this software, cite this repository revision and the accompanying paper when
+  it becomes available. Confirm the author list before creating a public release.
+title: cuML-DBSCANMulti
+type: software
+authors:
+  - family-names: Pereira
+    given-names: Matheus Antony Souza
+    affiliation: Universidade Federal de Viçosa
+repository-code: https://github.com/Math-BUG/cuML-DBSCANMulti
+abstract: >-
+  Research prototype for GPU DBSCAN with joint exploration of epsilon and minPts, derived
+  from the RAPIDS cuML DBSCAN pipeline.
+# `license` is intentionally absent: the project-wide license and private-source
+# provenance are unresolved. See docs/licenciamento-e-proveniencia.md.

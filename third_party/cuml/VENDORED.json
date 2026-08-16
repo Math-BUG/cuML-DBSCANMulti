@@ -1,0 +1,30 @@
+{
+  "schema_version": "1.0.0",
+  "repository": "https://github.com/rapidsai/cuml",
+  "tag": "v26.02.00",
+  "commit": "22b12c8c3e378f17f35107f7fb4ffd65a3dce534",
+  "files": [
+    {"path": "LICENSE", "git_blob_sha1": "3ba63d53f4bd8e218b5dd244b68b63d00bf30c66"},
+    {"path": "cpp/bench/sg/dbscan.cu", "git_blob_sha1": "cf63ae845babb450043437b0da4ac141375a402f"},
+    {"path": "cpp/include/cuml/cluster/dbscan.hpp", "git_blob_sha1": "6c0e7ccafbb41443391d5bc2aff6e8396161018d"},
+    {"path": "cpp/include/cuml/common/distance_type.hpp", "git_blob_sha1": "beda1f05e8bd1d1eca9b1dd0b1897897915a48f7"},
+    {"path": "cpp/include/cuml/common/logger.hpp", "git_blob_sha1": "cb902255f9ccf77dd1c33d13434c36ffc3b20fa4"},
+    {"path": "cpp/include/cuml/common/utils.hpp", "git_blob_sha1": "475780bd015a84c8339f0d314145d8749ebb352f"},
+    {"path": "cpp/src/common/nvtx.hpp", "git_blob_sha1": "7addc81eae6ca39558b870b2e9c0469fbab9041b"},
+    {"path": "cpp/src/dbscan/adjgraph/algo.cuh", "git_blob_sha1": "cf6a48d25564205c0aaf27c156374d4d71330628"},
+    {"path": "cpp/src/dbscan/adjgraph/pack.h", "git_blob_sha1": "8d8465c081e2fb356f2d745a9833704bf2acd04a"},
+    {"path": "cpp/src/dbscan/adjgraph/runner.cuh", "git_blob_sha1": "98dd99b39fb41f01468365af5f2cc6fc49a22c02"},
+    {"path": "cpp/src/dbscan/corepoints/compute.cuh", "git_blob_sha1": "17a2e2be1ce000e96174e597bea72f2912d1df4c"},
+    {"path": "cpp/src/dbscan/corepoints/exchange.cuh", "git_blob_sha1": "8134efe69560ca82de85a0461a3d7e76b62cade0"},
+    {"path": "cpp/src/dbscan/dbscan.cu", "git_blob_sha1": "00ce78f8e9fca982f8109a91b5a83e0206a22e22"},
+    {"path": "cpp/src/dbscan/dbscan.cuh", "git_blob_sha1": "5911a09999c454881f9ff3807e0d4a924b2dba39"},
+    {"path": "cpp/src/dbscan/mergelabels/runner.cuh", "git_blob_sha1": "9811f7275d404e9e04f015659c342ca58bdbb31a"},
+    {"path": "cpp/src/dbscan/mergelabels/tree_reduction.cuh", "git_blob_sha1": "80e1794ef90a3c19c9b7e0f34dcace7e7135e3e7"},
+    {"path": "cpp/src/dbscan/runner.cuh", "git_blob_sha1": "8e2e9b83c16fcd3882d132d6a5f16e0158670345"},
+    {"path": "cpp/src/dbscan/vertexdeg/algo.cuh", "git_blob_sha1": "649c20091b4860280d7a784846a2cd313c78f22e"},
+    {"path": "cpp/src/dbscan/vertexdeg/pack.h", "git_blob_sha1": "35cf4d73edcf77bab0331c3563335def54b62c75"},
+    {"path": "cpp/src/dbscan/vertexdeg/precomputed.cuh", "git_blob_sha1": "bac81ab310651517fdf27268683df17d60608019"},
+    {"path": "cpp/src/dbscan/vertexdeg/runner.cuh", "git_blob_sha1": "cd3a352d77371ba501b8278d2e262d8432d81fad"},
+    {"path": "cpp/tests/sg/dbscan_test.cu", "git_blob_sha1": "4cbe8c982b242a8b28941a2047e266535b6892bb"}
+  ]
+}

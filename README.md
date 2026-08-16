@@ -12,20 +12,28 @@ As três variantes saem de uma única função, `fit_multi`, que recebe *k* valo
 
 | Variante | Situação |
 |----------|----------|
-| Multi-minPts | Implementada; `--selftest` passa em GPU (A100) nos dois backends |
-| Multi-EPS | Implementada; `--selftest` passa em GPU (A100) nos dois backends |
+| Multi-minPts | Implementada; há registro local de `--selftest` em A100 nos dois backends |
+| Multi-EPS | Implementada; há registro local de `--selftest` em A100 nos dois backends |
 | Multi-Both | Implementada; a grade 3×3 do `--selftest` é exatamente este caso |
 
-Os dois backends produzem **os mesmos rótulos**, configuração a configuração — duas buscas
-de vizinhança independentes concordando nas mesmas asserções exatas.
+No job histórico 4909, os selftests separados de cuVS e `codes` registraram as mesmas
+contagens de clusters e ruído; **não compararam os vetores de rótulos entre si**. O HEAD
+agora faz essa comparação direta por partição canônica e repete `codes` três vezes para
+detectar não determinismo, mas essa versão ainda não foi executada no cluster. Portanto há
+capacidade de validação no código atual, não evidência GPU de que o novo gate passou.
 
-Falta a comparação de tempo e de rótulos contra o `cuml.cluster.DBSCAN`, que é o que
-`scripts/bench.slm` mede.
+A comparação de tempo e rótulos contra `cuml.cluster.DBSCAN` está implementada em
+`tools/bench_vs_cuml.py` e nos jobs Slurm. Os números adiante são **medições preliminares**:
+os logs que lhes deram origem ainda não são artefatos versionados e o ambiente completo
+ainda precisa ser congelado em `requirements.lock.txt`. Portanto eles descrevem aquelas
+execuções, não uma garantia de desempenho geral. O contrato para promover uma execução a
+resultado citável está em [docs/reprodutibilidade.md](docs/reprodutibilidade.md).
 
 ### Como o multi entra no cuML
 
-O princípio é **não reescrever nenhuma peça do cuML**, em particular não a busca de
-vizinhança, que é a mais cara e a mais ajustada. Por lote, o cuML faz:
+No backend cuVS, o princípio é **preservar o pipeline do cuML**, em particular a busca de
+vizinhança, que é a peça mais cara e mais ajustada. O backend alternativo `codes` é uma
+implementação independente para validação. Por lote, o cuML faz:
 
 ```
 cuVS epsilon_neighborhood::compute  ->  adjacência densa + graus
@@ -35,63 +43,93 @@ weak_cc_batched + MergeLabels  ->  rótulos
 
 Chamar isso *k* vezes repetiria a etapa cara — a distância par-a-par, O(N²·D) — *k* vezes.
 Pela monotonicidade do raio (vizinho sob um raio menor é vizinho sob todos os maiores), o
-CSR do **maior** ε já contém todos os pares de que qualquer ε menor precisa. Então o
-`cuvs` roda uma vez, no maior raio; cada entrada do CSR recebe o índice do menor ε que a
-contém (custo O(nnz·D), porque só pares que já são vizinhos são visitados); e o CSR de cada
-ε menor sai por **compactação**, O(nnz), sem recalcular distância nenhuma. Os graus em
-todos os raios caem de graça, como prefixo do histograma dos códigos de cada linha, e
-alimentam as máscaras de *core points* por *minPts*.
+CSR do **maior** ε já contém todos os pares de que qualquer ε menor precisa. A implementação
+mede a densidade depois dessa primeira busca e escolhe, **por lote**, entre duas rotas
+semanticamente equivalentes:
 
-Com `k = 1` e `l = 1` o caminho é, kernel a kernel, o do cuML — o que torna a comparação
-contra chamadas sequenciais uma medida honesta, sem imposto de implementação.
+1. **rota anotada, para grafo esparso:** cada entrada do CSR recebe o índice do menor ε que
+   a contém, O(nnz·D), e os CSRs menores saem por compactação, O(nnz) por raio;
+2. **rota densa:** a anotação faria acessos aleatórios sobre um CSR grande demais; o
+   resultado já obtido no maior ε é reutilizado, o cuVS calcula os demais raios e cada CSR
+   é construído diretamente — uma chamada por ε no total.
 
-Isso vale enquanto o maior ε for seletivo, que é o regime de interesse do DBSCAN: o ganho é
-a razão entre N²·D e nnz·D. Se o maior ε levar *nnz* para perto de N², a anotação custa o
-mesmo que uma passagem completa — mas nesse regime todo ponto é vizinho de todos e o
-agrupamento perdeu o sentido.
+Logo, compartilhar a busca uma única vez é a rota principal no regime seletivo do DBSCAN,
+mas não é uma invariável do executável. A decisão adaptativa está em
+`anotar_compensa`/`run_multi_grid_cuvs`, e o `--selftest` força as duas rotas para exigir
+partições idênticas.
+
+Com `k = 1` e `l = 1`, **no backend cuVS**, a busca e as etapas herdadas seguem o caminho
+algorítmico do cuML. Isso não torna os tempos automaticamente equivalentes: o Python cuML
+usa `int32` e uma política própria de memória, enquanto este binário pode escolher outro
+índice/orçamento/batching. Uma comparação isolada só controla essa diferença quando as
+escolhas efetivas também coincidem; o JSON registra isso em `batch_budget_protocol`.
+
+O ganho da rota anotada depende de o maior ε ser seletivo: a relação relevante é entre
+N²·D e nnz·D. Se o maior ε levar *nnz* para perto de N², a anotação se aproxima do custo de
+uma passagem completa e a política adaptativa pode escolher a rota densa.
 
 ### Dois backends
 
 | `--backend` | Busca de vizinhança | Depende de |
 |---|---|---|
 | `cuvs` (padrão) | `cuvs::neighbors::epsilon_neighborhood::compute`, a mesma chamada do cuML | `libcuvs` |
-| `codes` | kernel próprio, grava o índice do menor ε por par numa matriz N×N de bytes | nada além de RAFT/RMM |
+| `codes` | kernel próprio, grava o índice do menor ε por par numa matriz N×N de bytes | RAFT/RMM e as dependências comuns exigidas pelo build atual |
 
 O `cuvs` é o caminho principal, porque é o que significa reaproveitar o cuML. O `codes`
 existe por dois motivos: compila sem `libcuvs`, e é uma segunda implementação independente
 para validação cruzada — as duas têm de concordar nas mesmas asserções exatas do
 `--selftest`.
 
-O `--selftest` cobre três coisas, e as duas últimas existem porque não apareceriam num
-teste de caminho feliz:
+O `--selftest` atual cobre oito grupos de propriedades; alguns são condicionais ao backend
+e os últimos exercitam caminhos que não aparecem num teste de caminho feliz:
 
 1. as **duas monotonicidades** numa grade 3×3 — com ε fixo o ruído não diminui quando
    *minPts* cresce; com *minPts* fixo não aumenta quando ε cresce. São propriedades
    acopladas: a coluna quebra se a matriz de códigos errar o menor ε que contém o par, a
    linha quebra se as máscaras errarem o maior *minPts* em que o ponto ainda é *core*;
-2. **múltiplos lotes**: a mesma grade com o orçamento de memória apertado a ponto de
+2. **comparação direta cuVS↔`codes` e determinismo**: no build cuVS, compara as nove
+   partições canônicas com `codes` e repete `codes` três vezes. Este grupo ainda não tem
+   execução registrada no cluster;
+3. **múltiplos lotes**: a mesma grade com o orçamento de memória apertado a ponto de
    forçar 4 lotes, exigindo rótulos idênticos aos do lote único. É o que exercita a fusão
    de rótulos entre lotes, a parte mais delicada herdada do cuML, que em dados pequenos
    nunca roda;
-3. **variação de D e de k**: D ∈ {2, 8, 16, 32, 33} × k ∈ {1, 3, 5}. No backend `codes`
+4. **variação de D e de k**: D ∈ {2, 8, 16, 32, 33} × k ∈ {1, 3, 5}. No backend `codes`
    isso percorre os quatro kernels de registrador, o genérico e as três especializações em
    *MAX_K*; no `cuvs`, exercita a anotação com e sem a linha de consulta em memória
    compartilhada. As dimensões extras são preenchidas com zero, que não altera a distância
    — a resposta esperada continua sendo exatamente três clusters, para qualquer D;
-4. **tipo de índice**: a mesma grade com `int64`, exigindo rótulos idênticos aos de
+5. **fallback de dimensão muito alta**: no backend `codes`, compara D = 33 com D = 8193,
+   que excede o tile em memória compartilhada e força o caminho de fallback;
+6. **tipo de índice**: a mesma grade com `int64`, exigindo rótulos idênticos aos de
    `int32`. O tipo é detalhe de representação, e como N do selftest é pequeno esta é a
-   única oportunidade de exercitar a instanciação `int64` com uma resposta conhecida.
+   única oportunidade de exercitar a instanciação `int64` com uma resposta conhecida;
+7. **correção de lote**: fornece um `neigh_per_row` deliberadamente otimista e exige que a
+   recuperação reduza o lote sem mudar as partições;
+8. **rotas do cuVS**: força tanto anotação/compactação quanto reconstrução densa por ε e
+   exige rótulos idênticos configuração a configuração. Em `codes`, rota é
+   **não aplicável** (`route_tested=false`), não uma aprovação trivial.
 
-O `scripts/check_gpu.slm` roda o `--selftest` nos **dois** backends, o que os torna
-validação cruzada um do outro.
+O `scripts/check_gpu.slm` atual roda o selftest cuVS — que faz a comparação direta com
+`codes` — e também o selftest do binário `codes` isolado. Esse fluxo ainda precisa ser
+executado e preservado no cluster para se tornar evidência do HEAD.
 
 ## Ambiente
 
 Um venv só, no **nó de login** — é download e instalação, não precisa de GPU nem de fila:
 
+Na primeira criação, instale o baseline e deixe o próprio cluster resolver as transitivas:
+
 ```bash
-bash scripts/setup_env.sh                 # ferramentas
-INSTALL_CUML=1 bash scripts/setup_env.sh  # + baseline RAPIDS (download grande)
+INSTALL_CUML=1 bash scripts/setup_env.sh  # gera requirements.lock.txt
+source .venv/bin/activate
+```
+
+Revise e versione o `requirements.lock.txt` produzido. Depois disso, uma reprodução deve
+instalar e conferir exatamente esse ambiente, sem nova resolução:
+
+```bash
+RECREATE_VENV=1 USE_LOCK=1 bash scripts/setup_env.sh
 source .venv/bin/activate
 ```
 
@@ -99,30 +137,45 @@ O script carrega os módulos sozinho (`GCCcore/12.2.0`, `CUDA/12.6.0`) e define
 `PYTHONNOUSERSITE=1`, para o venv não enxergar o `~/.local/.../site-packages` — mesmo
 padrão do `setup_venv_cluster.sh` do INF-494, que já roda nesse cluster.
 
-Um venv só, em duas etapas: as ferramentas primeiro, o RAPIDS depois. É a parte que mais
-falha em cluster, e separando dá para gerar datasets, compilar e rodar o `--selftest`
-mesmo se ela quebrar.
+Sem `USE_LOCK=1`, o script instala as ferramentas e, com `INSTALL_CUML=1`, o RAPIDS; ao
+fim grava `requirements.lock.txt`. Com `USE_LOCK=1`, instala somente o lock existente e
+falha se `pip freeze` divergir. Não combine uma reprodução citável com resolução aberta.
 
-Usa o `python3` padrão do cluster (3.10.12), sem `module load Python`. Por isso o RAPIDS
-fica na série **26.02**: a partir do 26.04 os wheels exigem Python 3.11.
+Usa o `python3` padrão do cluster (3.10.12), sem `module load Python`. Por isso os pacotes
+RAPIDS diretos ficam restritos à série **26.02** em `requirements-cuml.txt`: a série 26.02
+é a última que suporta Python 3.10. O lock ainda precisa ser gerado, revisado e versionado
+no ClusterGPU/UFV; até lá, o ambiente não é reproduzível a partir de um clone. Não fabrique
+retrospectivamente versões transitivas fora do cluster.
 
-Os wheels trazem os cabeçalhos C++ em `site-packages/{libraft,librmm}/include`, e é por
+Os wheels trazem os cabeçalhos C++ em `site-packages/{libraft,librmm,rapids_logger}/include`, e é por
 isso que **não é preciso conda nem compilar o cuML**. O `librmm/include/rapids` ainda traz
 o CCCL (cuda/std, thrust, cub) na versão exata contra a qual RAFT e RMM foram compilados,
 evitando depender do CCCL do módulo CUDA.
 
-Se a `HOME` tiver cota apertada (o RAPIDS passa de 3 GB):
+Se a `HOME` tiver cota apertada (o RAPIDS passa de 3 GB), mantenha o mesmo `VENV_DIR` na
+criação e nas reproduções:
 
 ```bash
-VENV_DIR=~/dados/venvs/dbscanmulti bash scripts/setup_env.sh
+VENV_DIR=~/dados/venvs/dbscanmulti INSTALL_CUML=1 bash scripts/setup_env.sh
+VENV_DIR=~/dados/venvs/dbscanmulti RECREATE_VENV=1 USE_LOCK=1 bash scripts/setup_env.sh
 ```
 
-Para compilar sem instalar o RAPIDS, um wheel é um zip:
-`bash scripts/fetch_rapids_headers.sh` extrai só o `include/`, sem pip.
+Os jobs também evitam o `/tmp` compartilhado do nó: criam um diretório exclusivo em
+`~/dados/dbscanmulti/tmp` e o removem ao terminar. Use `DBM_TMP_BASE=/outra/particao` para
+alterar esse local.
+
+Para compilar sem instalar os pacotes Python RAPIDS, um wheel é um zip:
+`bash scripts/fetch_rapids_headers.sh` extrai `include/` e `lib64/` de
+RAFT/RMM/cuVS/rapids_logger, sem
+pip nem venv.
 
 ## Build
 
 Compila com `nvcc` direto — sem o CMake do cuML e sem `libcuml++`.
+
+Se a árvore tiver `.git`, o build registra o commit e o estado *dirty*. Em cópias do
+cluster sem `.git`, registra automaticamente um SHA-256 determinístico dos fontes com
+`revision_kind="source-tree-sha256"`; não é necessário inicializar um repositório no nó.
 
 ```bash
 make check-headers                  # mostra onde achou RAFT/RMM/cuVS
@@ -135,7 +188,9 @@ make CUDA_ARCH=sm_80 BACKEND=codes  # sem libcuvs
 Com o venv ativo, os caminhos de RAFT/RMM são descobertos sozinhos. Em conda, passe
 `RAPIDS_INCLUDE=$CONDA_PREFIX/include`.
 
-`librmm.so` e `librapids_logger.so` sempre entram no link — RMM não é header-only.
+`librmm.so` entra no link — RMM não é *header-only*. O shim local substitui o cabeçalho de
+logger gerado pelo CMake do cuML; `rapids-logger` ainda é necessário porque
+`raft/core/logger.hpp` inclui seus headers, e `librapids_logger.so` entra no link.
 `LINK_RAFT=1` acrescenta `libraft.so`, que puxa nccl/cublas/cusolver/cusparse; é a
 configuração que fecha o link no ClusterGPU/UFV. `BACKEND=cuvs` (o padrão) acrescenta
 `libcuvs.so`, que vem como dependência do `cuml-cu12`. O `-rpath` já aponta para os
@@ -153,11 +208,12 @@ seriam comparáveis com os números já publicados.
 
 Os datasets vão para a **partição de dados**, não para a HOME — a suíte completa passa de
 2 GB, e muito mais se entrarem N de 512k e 1M. Os scripts Slurm usam
-`~/dados/dbscanmulti/{data,results}` por padrão, sobreponível por `DBM_BASE`, `DATA_DIR` ou
-`RESULTS_DIR`. O gerador, quando chamado à mão, precisa do `--out-dir` apontando para lá.
+`~/dados/dbscanmulti/knn-sample-rank-v2/{data,results}` por padrão, sobreponível por
+`DBM_BASE`, `DATA_DIR` ou `RESULTS_DIR`. O sufixo de protocolo impede colisão com a campanha
+histórica. O gerador, quando chamado à mão, precisa do `--out-dir` apontando para lá.
 
 ```bash
-export DBM_BASE=$HOME/dados/dbscanmulti
+export DBM_BASE=$HOME/dados/dbscanmulti/knn-sample-rank-v2
 
 python tools/gerar_datasets.py --listar
 python tools/gerar_datasets.py --dataset moons_16d --n 100000 --out-dir "$DBM_BASE/data"
@@ -215,21 +271,34 @@ estimada por Levina-Bickel combinada com `log2(N)` (4 candidatos), e ε pelos qu
 0,50 / 0,70 e 0,85 da curva k-distância (3 candidatos) — a grade 3×4 = 12 configurações.
 Já saem ordenados, que é a pré-condição do binário.
 
+**Fronteira de protocolo:** a versão atual corrige o posto kNN pela fração amostral quando
+`N > 60.000`; usar o mesmo posto numa amostra de 60 mil inflava ε para populações maiores.
+O JSON novo registra população, tamanho da amostra, *minPts* populacional, posto amostral e
+SHA-256 dos pontos, rótulos e gerador, além de
+`"protocolo_dataset": "knn-sample-rank-v2"`. Todos os jobs validam esse identificador antes
+de reutilizar um arquivo; metadados antigos ou uma grade de variantes diferente da esperada
+encerram o job com erro. Datasets/grades anteriores a essa correção — inclusive
+os usados nos jobs 4911–4917 — são protocolo histórico. A nova campanha deve regenerá-los,
+obter hashes novos e não misturar as duas versões numa mesma agregação ou comparação direta
+sem identificar explicitamente a mudança de protocolo.
+
 O JSON alimenta tanto o nosso executável quanto o *baseline* cuML com **exatamente** os
 mesmos parâmetros, que é o que torna a comparação de tempo honesta.
 
 ## Uso
 
-Segue o contrato de linha de comando do DBSCANMultiE, para reaproveitar o *harness* de
-benchmark e validação, com `--min-samples` estendido para aceitar lista:
+Mantém compatibilidade com o contrato de linha de comando documentado pelo projeto
+DBSCANMultiE, com `--min-samples` estendido para aceitar lista. Isso descreve uma interface;
+não implica incorporação nem autorização para reutilizar o *harness* privado:
 
 ```bash
-./build/dbscan_multi --input points.f32 --output labels.i32 \
-                     --n 100000 --d 16 --eps 0.25,0.35,0.5 --min-samples 5,10,20,40 --json
+BIN="$(make -s print-target CUDA_ARCH=sm_80 LINK_RAFT=1)"
+"$BIN" --input points.f32 --output labels.i32 \
+       --n 100000 --d 16 --eps 0.25,0.35,0.5 --min-samples 5,10,20,40 --json
 
 # faixa de eps, no mesmo formato do DBSCANMultiE
-./build/dbscan_multi --input points.f32 --n 100000 --d 16 \
-                     --eps-min 0.1 --eps-max 0.5 --eps-step 0.1 --min-samples 5 --json
+"$BIN" --input points.f32 --n 100000 --d 16 \
+       --eps-min 0.1 --eps-max 0.5 --eps-step 0.1 --min-samples 5 --json
 ```
 
 - `points.f32`: matriz *row-major* float32, sem cabeçalho;
@@ -242,8 +311,11 @@ benchmark e validação, com `--min-samples` estendido para aceitar lista:
 - `fit_ms` cobre a execução do algoritmo, incluindo a alocação do workspace, e exclui
   leitura de arquivo e as transferências de entrada e saída;
 - `--repeat R` mede R execuções e reporta a mediana em `fit_ms` (todas em `fit_ms_all`);
-  `--warmup W` descarta as W primeiras. A primeira chamada do processo paga o carregamento
-  do módulo CUDA, que não é custo do algoritmo — sem `--warmup 1` a medição fica inflada.
+  `--warmup W` descarta as W primeiras. O bloco `execution` descreve somente a última
+  repetição medida (`stats_scope="last_measured_repeat"`), não a agregação das R repetições;
+  use `fit_ms_all` para auditar a mediana. A primeira chamada do processo paga o
+  carregamento do módulo CUDA, que não é custo do algoritmo — sem `--warmup 1` a medição
+  fica inflada.
 
 ## Comparação com o cuML
 
@@ -255,7 +327,12 @@ sbatch --export=ALL,NEIGH_PER_ROW=512 scripts/bench.slm    # tenta colapsar para
 
 sbatch scripts/bench_variantes.slm    # as três variantes separadas + varredura de k e l
 sbatch scripts/bench_escala.slm       # ganho em função de N
-sbatch --export=ALL,DATASET=core_halo_16d,NS=4000,16000,64000,256000,1000000 scripts/bench_escala.slm
+
+# O Slurm interpreta vírgulas dentro de --export como separadores de variáveis.
+export DATASET=core_halo_16d
+export NS='4000,16000,64000,256000,1000000'
+sbatch --export=ALL scripts/bench_escala.slm
+unset DATASET NS
 ```
 
 O `bench_variantes.slm` mede Multi-EPS, Multi-minPts e Multi-Both **com o mesmo número de
@@ -263,13 +340,17 @@ configurações**, que é a única comparação justa entre elas, e varre o núm
 configurações para ajustar `S` e `L` por mínimos quadrados em vez de extrapolar de dois
 pontos. As três compartilham coisas diferentes: em Multi-minPts o grau de um ponto não
 depende de *minPts*, então a busca de vizinhança inteira é compartilhada e só a rotulagem
-roda por configuração — é o teto; Multi-EPS ainda paga a anotação do CSR, O(nnz·D), e uma
-compactação O(nnz) por raio.
+roda por configuração — é o teto. Multi-EPS paga anotação O(nnz·D) e compactação O(nnz)
+por raio quando a rota esparsa vence; em lote denso, paga uma busca cuVS e a construção do
+CSR por raio. O manifesto da execução deve registrar o perfil/rota usado para a leitura do
+custo.
 
 Ou direto, com o venv ativo e uma GPU disponível:
 
 ```bash
-python tools/bench_vs_cuml.py --meta data/moons_16d_n100000.json --validar --imposto
+BIN="$(make -s print-target CUDA_ARCH=sm_80 LINK_RAFT=1)"
+python tools/bench_vs_cuml.py --binario "$BIN" \
+  --meta data/moons_16d_n100000.json --validar --imposto
 ```
 
 As duas metades rodam no **mesmo job**, de propósito: o nó é compartilhado e o orçamento
@@ -279,39 +360,36 @@ os dados já na GPU, com `cudaEvent`, mesmo *warmup* e mediana de `--repeat` exe
 baseline recebe `calc_core_sample_indices=False`, porque também não calculamos esses
 índices — cobrá-los dele inflaria o ganho.
 
-`--imposto` roda **uma** configuração de cada lado e devolve `T = nosso / cuML`. Como o
-caminho k=1, l=1 é kernel a kernel o do cuML, T mede se sobrou trabalho extra no runner.
-Ele também produz `ganho_multi_puro` — a grade de uma vez contra o **mesmo binário** rodando
-uma configuração por vez. É o único número que isola o compartilhamento entre configurações
-de qualquer outra diferença de ajuste.
+`--imposto` roda **uma** configuração de cada lado e devolve `T = nosso / cuML`. `T` inclui
+qualquer diferença de índice, orçamento e batching que permaneça entre o binário e a API
+Python; não deve ser descrito apenas como “imposto do runner”. O campo
+`batch_budget_protocol` registra se o pedido de memória foi controlado dos dois lados e
+deixa explícito que o orçamento efetivo interno do cuML não é observável. Já
+`ganho_multi_puro` compara a grade com o **mesmo binário** uma configuração por vez, sob as
+mesmas escolhas, e é a alegação causal mais limpa sobre compartilhamento multiparamétrico.
 
-### Resultado medido (A100, `moons_16d`, N=100k, grade 3×4)
+### Evidência histórica/preliminar (logs locais 4909 e 4911–4917)
 
-| | `int32`, 5 lotes | `int64` + `--neigh-per-row 512`, 1 lote |
-|---|---|---|
-| Speedup contra o cuML | 7,46× | **11,03×** |
-| Ganho do multi isolado | 7,77× | **8,46×** |
-| Imposto (k=1, l=1) | 1,02× | **0,76×** |
-| Partições idênticas | 12/12, ARI 1,000000 | 12/12, ARI 1,000000 |
+Esta é a série local mais recente disponível para inspeção, mas os logs não registram SHA
+do commit nem hash/`build_id` do binário. Portanto **não provam o comportamento do HEAD**,
+não satisfazem o manifesto e não devem ser promovidos a resultado reproduzível. Também
+antecedem o gate por oráculo semântico descrito abaixo e a correção do posto kNN para
+`N > 60.000`; suas grades não são diretamente comparáveis às que o gerador atual produzirá.
 
-As duas colunas mostram efeitos diferentes. O **ganho do multi isolado** compara o binário
-com ele mesmo e é o que mede o compartilhamento entre configurações: 7,77× → 8,46×, porque
-com um lote só desaparecem as fusões de rótulos entre lotes, que custavam por configuração.
-O **imposto** de 0,76× diz que, com um lote, uma configuração nossa custa 112 ms contra 149
-do cuML — 1,32× a mais de speedup que vem do tamanho do lote, não do multi. Os 11,03×
-são o produto dos dois (8,46 × 1,32 ≈ 11,2, dentro do ruído do nó).
+| Recorte histórico | Evidência registrada |
+|---|---|
+| Jobs 4911–4916 | 612 grades / 7.344 configurações; 98,434% de partições exatas; todas as máscaras e contagens de ruído/clusters iguais; ARI mínimo 0,999234; speedup mediano 4,6778×; ganho multi puro mediano 3,6111× |
+| Job 4917, variantes | 47/48 partições exatas; ARI mínimo 0,999855; ganhos multi puros: Multi-EPS (8 ε) 6,099×, Multi-minPts (8 valores) 7,375× e Multi-Both 6,688× |
 
-Ajustando `total = S + c·L`: com 5 lotes, `S ≈ 142 ms` e `L ≈ 8,3 ms` por configuração; com
-1 lote, `S ≈ 107 ms` e `L ≈ 4,5 ms`. Ou seja, as fusões respondiam por cerca de metade do
-custo por configuração. O teto do ganho do multi é `solo/L`, que sobe de ~18× para ~25×.
+Essas observações permitem dizer apenas que aqueles executáveis produziram alta
+concordância com o cuML naqueles casos e tempos. Máscaras/contagens iguais e ARI alto não
+substituem a verificação independente de *core*, componentes, ruído e borda, e os speedups
+não se generalizam além dos jobs registrados.
 
-O imposto abaixo de 1 é um achado sobre o cuML, não um truque de medição: em N=100k ele
-roda 5 lotes por causa do `int32` e da estimativa de pior caso, o que faz a busca de
-vizinhança cobrir 1,93× mais pares do que os N² necessários. É exatamente o que o log dele
-avisa e o que o `///@todo: expose neigh_per_row` antecipa.
+### Diagnóstico histórico: reaproveitar o workspace entre chamadas
 
-### Reaproveitar o workspace entre chamadas
-
+Os números desta subseção vêm dos jobs 4862–4865 e permanecem somente como trilha do
+diagnóstico que motivou o workspace externo; não são a evidência principal de desempenho.
 Chamar `fit_multi` repetidamente no mesmo processo degradava: a segunda chamada em diante
 custava **2,3×** a primeira (jobs 4862 e 4863). Ficou evidente ao variar só *minPts*, que
 não altera a busca de vizinhança — quatro configurações com trabalho idêntico deram 112,
@@ -366,17 +444,69 @@ configuração**.
 - `--index auto` (padrão) usa `int64` quando `N² ≥ INT_MAX`. É o mesmo template do cuML.
 - `--neigh-per-row V` dimensiona o lote supondo V vizinhos por linha em vez do pior caso N.
   É o parâmetro `neigh_per_row` que existe em `dbscan.cuh` do cuML com um
-  `///@todo: expose neigh_per_row to the user` — aqui ele está exposto. Se V ficar muito
-  abaixo do grau real, a alocação do CSR falha com `rmm::bad_alloc`, sem corromper nada.
+  `///@todo: expose neigh_per_row to the user` — aqui ele está exposto. Como V é só um
+  palpite, o runner mede o `nnz` antes de alocar o CSR; se o lote não couber, reduz o teto
+  pelo grau observado e tenta novamente (até três tentativas, com pior caso N na última
+  correção). O JSON registra `attempts` e `batch_corrections`; uma entrada que não caiba
+  nem com o lote reduzido termina com erro, nunca como execução parcial aprovada.
 
 **Leitura honesta do speedup:** `cuml.cluster.DBSCAN` usa `int32` e não expõe nenhum dos
 dois. Usá-los é uma vantagem que o usuário do cuML não tem, e o `--imposto` a captura — se
 `T` cair abaixo de 1, um fator `1/T` do speedup vem daí e não do multi. Por isso o
 `ganho_multi_puro`, que compara o binário com ele mesmo.
 
-`--validar` compara os rótulos com os do cuML configuração a configuração: ARI,
-concordância de ruído e igualdade exata da partição (renumerando os clusters pela ordem de
-primeira aparição, já que rótulos de DBSCAN são invariantes a permutação).
+`--validar` reporta ARI, concordância de ruído e igualdade da partição canônica. Essas
+métricas são diagnósticos úteis, mas **não são o gate científico de correção**: ARI alto
+pode esconder uma violação local, e duas implementações corretas podem escolher componentes
+diferentes para um ponto de borda adjacente a mais de um cluster.
+
+### Gate científico de correção
+
+Depois do build cuVS, rode em uma alocação com GPU e o ambiente cuML ativo:
+
+```bash
+make CUDA_ARCH=sm_80 LINK_RAFT=1
+python tools/run_validation_matrix.py \
+  --binary "$(make -s print-target CUDA_ARCH=sm_80 LINK_RAFT=1)" \
+  --random-seeds 10
+```
+
+Esse é o gate rápido de desenvolvimento. Para a campanha de defesa/publicação, use
+`--random-seeds 100`, preserve `results/validation-matrix.json` e seu SHA-256 no manifesto.
+O programa termina com código 2 se algum caso falhar e grava reproduções mínimas em
+`validation_failures/`.
+
+A matriz confronta cuVS, `codes` e cuML; força as rotas cuVS anotada e densa; cobre
+`int32`/`int64`, lote único e múltiplos lotes; e verifica determinismo. As execuções com
+rota forçada existem **somente para validação**. Medições do protocolo principal devem usar
+`--route auto`, registrar a rota efetivamente observada por lote e nunca misturar tempos da
+matriz de correção com o benchmark adaptativo.
+
+Para cada caso pequeno, um oráculo CPU independente constrói o grafo ε exato e exige:
+
+- pontos *core* exatamente quando a vizinhança fechada tem pelo menos *minPts* elementos;
+- um cluster distinto para cada componente conexo do subgrafo de pontos *core*;
+- ruído somente quando um ponto não-*core* não tem vizinho *core*;
+- ponto de borda atribuído a um componente *core* adjacente, aceitando a ambiguidade
+  legítima quando há mais de um.
+
+Rótulos já salvos também podem ser auditados sem GPU. A ordem é `eps-major`, com um
+`int32` por ponto e configuração:
+
+```bash
+python tools/validate_dbscan_matrix.py \
+  --input data.f32 --n 100 --d 2 --eps 0.2,0.3 --min-samples 4,8 \
+  --labels-cuvs cuvs.i32 --labels-codes codes.i32 --labels-cuml cuml.i32 \
+  --exigir-tres-fontes --out validation.json
+
+# reproduz exatamente um caso salvo por qualquer gate de validação
+python tools/validate_dbscan_matrix.py --artifact validation_failures/failure.json
+```
+
+O oráculo é denso de propósito e recusa `N > --oraculo-max-n` (padrão: 5000), em vez de
+degradar silenciosamente para uma aproximação. Benchmarks grandes podem reportar
+ARI/partição, mas a alegação de correção deve referenciar, no mesmo commit/build, uma matriz
+pequena/adversarial aprovada pelo oráculo.
 
 ## Cluster (ClusterGPU/UFV)
 
@@ -401,6 +531,24 @@ Não rode o teste de GPU no nó de *login*.
 | [src/compat/](src/compat/) | *Shim* de cabeçalho do cuML que só existe no build do CMake deles |
 | [src/main.cu](src/main.cu) | Executável de linha de comando |
 | [scripts/](scripts/) | Jobs Slurm: `check_gpu.slm` (sanidade), `bench.slm` (comparação) |
-| [tools/](tools/) | Geração de datasets e o comparador contra o baseline cuML |
+| [tools/](tools/) | Geração de datasets, benchmark, matriz de correção e oráculo DBSCAN offline |
 | [docs/fontes-primarias.md](docs/fontes-primarias.md) | Fontes, versões fixadas, pontos de modificação, licenças e pendências |
+| [docs/reprodutibilidade.md](docs/reprodutibilidade.md) | Critério de aceite, metadados e limites das alegações experimentais |
+| [docs/prontidao-publicacao.md](docs/prontidao-publicacao.md) | Checklist P0/P1/P2 e alegações atualmente sustentadas |
+| [docs/licenciamento-e-proveniencia.md](docs/licenciamento-e-proveniencia.md) | Estado jurídico por fonte e bloqueios externos ainda abertos |
+| [schemas/](schemas/) | Schemas versionados do manifesto experimental e do estado de proveniência |
+| [results/](results/) | Manifests e resumos pequenos revisados; dados e logs brutos continuam fora do Git |
 | [NOTICE](NOTICE) | Atribuição Apache-2.0 e lista de arquivos derivados |
+
+## Licença, citação e contribuição
+
+O subconjunto em `third_party/cuml/` é Apache-2.0 e os arquivos derivados identificados no
+`NOTICE` preservam os avisos correspondentes. **O repositório como um todo ainda não tem
+uma licença raiz escolhida pelos autores**, e a autorização referente à fonte privada F2
+continua pendente. `NOTICE` e cabeçalhos SPDX de arquivos individuais não substituem essa
+decisão. Veja [docs/licenciamento-e-proveniencia.md](docs/licenciamento-e-proveniencia.md)
+antes de redistribuir ou publicar uma release.
+
+Para citar o software, use [CITATION.cff](CITATION.cff), revisando autores e versão no
+momento da release. Para mudanças, consulte [CONTRIBUTING.md](CONTRIBUTING.md); o gate local
+de metadados é `python scripts/check_repo_metadata.py`.

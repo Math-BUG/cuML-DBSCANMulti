@@ -1,0 +1,506 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/Math-BUG/cuML-DBSCANMulti/schemas/experiment-manifest.schema.json",
+  "title": "cuML-DBSCANMulti experiment manifest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "experiment_id",
+    "created_at",
+    "status",
+    "repository",
+    "upstream",
+    "environment",
+    "binary",
+    "dataset",
+    "protocol",
+    "measurements",
+    "artifacts",
+    "validation",
+    "claims",
+    "publication"
+  ],
+  "properties": {
+    "$schema": {"type": "string"},
+    "schema_version": {"const": "1.2.0"},
+    "experiment_id": {"type": "string", "minLength": 1},
+    "created_at": {"type": "string", "format": "date-time"},
+    "status": {
+      "enum": ["preliminary", "reproducible", "publication-ready"]
+    },
+    "repository": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["commit", "dirty", "remote", "tag"],
+      "properties": {
+        "commit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+        "dirty": {"type": "boolean"},
+        "remote": {"type": "string", "format": "uri"},
+        "tag": {"type": ["string", "null"]}
+      }
+    },
+    "upstream": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "vendored_cuml_tag",
+        "vendored_cuml_commit",
+        "baseline_cuml_version",
+        "cupy_version",
+        "raft_version",
+        "rmm_version",
+        "cuvs_version"
+      ],
+      "properties": {
+        "vendored_cuml_tag": {"const": "v26.02.00"},
+        "vendored_cuml_commit": {
+          "const": "22b12c8c3e378f17f35107f7fb4ffd65a3dce534"
+        },
+        "baseline_cuml_version": {"type": ["string", "null"]},
+        "cupy_version": {"type": ["string", "null"]},
+        "raft_version": {"type": ["string", "null"]},
+        "rmm_version": {"type": ["string", "null"]},
+        "cuvs_version": {"type": ["string", "null"]}
+      }
+    },
+    "environment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "gpu_model",
+        "driver_version",
+        "cuda_toolkit",
+        "compute_capability",
+        "python_version",
+        "compiler",
+        "build_command"
+      ],
+      "properties": {
+        "gpu_model": {"type": ["string", "null"]},
+        "driver_version": {"type": ["string", "null"]},
+        "cuda_toolkit": {"type": ["string", "null"]},
+        "compute_capability": {"type": ["string", "null"]},
+        "python_version": {"type": ["string", "null"]},
+        "compiler": {"type": ["string", "null"]},
+        "build_command": {"type": ["string", "null"]}
+      }
+    },
+    "binary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "sha256",
+        "build_id",
+        "git_sha",
+        "git_dirty",
+        "configured_backend",
+        "compiled_backends"
+      ],
+      "properties": {
+        "sha256": {
+          "type": ["string", "null"],
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "build_id": {"type": ["string", "null"]},
+        "git_sha": {
+          "type": ["string", "null"],
+          "pattern": "^[0-9a-f]{7,40}$"
+        },
+        "git_dirty": {"type": ["boolean", "null"]},
+        "configured_backend": {
+          "type": ["string", "null"],
+          "enum": ["cuvs", "codes", null]
+        },
+        "compiled_backends": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {"enum": ["cuvs", "codes"]}
+        }
+      }
+    },
+    "dataset": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "n",
+        "d",
+        "seed",
+        "points_sha256",
+        "labels_sha256",
+        "metadata_sha256",
+        "generator_sha256",
+        "generation_method"
+      ],
+      "properties": {
+        "name": {"type": "string", "minLength": 1},
+        "n": {"type": "integer", "minimum": 1},
+        "d": {"type": "integer", "minimum": 1},
+        "seed": {"type": ["integer", "null"]},
+        "points_sha256": {
+          "type": ["string", "null"],
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "labels_sha256": {
+          "type": ["string", "null"],
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "metadata_sha256": {
+          "type": ["string", "null"],
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "generator_sha256": {
+          "type": ["string", "null"],
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "generation_method": {"type": ["string", "null"]}
+      }
+    },
+    "protocol": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "backend",
+        "route_policy",
+        "route_observed",
+        "execution_stats_scope",
+        "index_requested",
+        "index_effective",
+        "neigh_per_row",
+        "max_mbytes_per_batch",
+        "batch_budget_protocol",
+        "warmup",
+        "repeat",
+        "statistic",
+        "precision",
+        "metric",
+        "config_order",
+        "eps",
+        "min_samples"
+      ],
+      "properties": {
+        "backend": {"enum": ["cuvs", "codes"]},
+        "route_policy": {"const": "adaptive-per-batch"},
+        "route_observed": {"enum": ["annotated", "dense", "mixed", "not-applicable", "unknown"]},
+        "execution_stats_scope": {"const": "last_measured_repeat"},
+        "index_requested": {"enum": ["auto", "int32", "int64"]},
+        "index_effective": {"enum": ["int32", "int64"]},
+        "neigh_per_row": {"type": "integer", "minimum": 0},
+        "max_mbytes_per_batch": {"type": "integer", "minimum": 0},
+        "batch_budget_protocol": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "controlled_equal_request",
+            "requested_mbytes_each",
+            "multi_requested_bytes",
+            "multi_effective_bytes",
+            "multi_auto_policy",
+            "cuml_requested_bytes",
+            "cuml_effective_bytes",
+            "cuml_effective_observable",
+            "cuml_auto_policy"
+          ],
+          "properties": {
+            "controlled_equal_request": {"type": "boolean"},
+            "requested_mbytes_each": {"type": ["integer", "null"], "minimum": 1},
+            "multi_requested_bytes": {"type": ["integer", "null"], "minimum": 1},
+            "multi_effective_bytes": {"type": ["integer", "null"], "minimum": 1},
+            "multi_auto_policy": {"type": ["string", "null"]},
+            "cuml_requested_bytes": {"type": ["integer", "null"], "minimum": 1},
+            "cuml_effective_bytes": {"type": ["integer", "null"], "minimum": 1},
+            "cuml_effective_observable": {"type": "boolean"},
+            "cuml_auto_policy": {"type": ["string", "null"]}
+          }
+        },
+        "warmup": {"type": "integer", "minimum": 0},
+        "repeat": {"type": "integer", "minimum": 1},
+        "statistic": {"enum": ["median", "mean"]},
+        "precision": {"const": "float32"},
+        "metric": {"const": "L2"},
+        "config_order": {"const": "eps_major"},
+        "eps": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 16,
+          "items": {"type": "number", "exclusiveMinimum": 0}
+        },
+        "min_samples": {
+          "type": "array",
+          "minItems": 1,
+          "items": {"type": "integer", "minimum": 1}
+        }
+      }
+    },
+    "measurements": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["multi_ms", "cuml_sequential_ms", "speedup", "multi_gain", "overhead"],
+      "properties": {
+        "multi_ms": {"type": ["number", "null"], "exclusiveMinimum": 0},
+        "cuml_sequential_ms": {"type": ["number", "null"], "exclusiveMinimum": 0},
+        "speedup": {"type": ["number", "null"], "exclusiveMinimum": 0},
+        "multi_gain": {"type": ["number", "null"], "exclusiveMinimum": 0},
+        "overhead": {"type": ["number", "null"], "exclusiveMinimum": 0}
+      }
+    },
+    "artifacts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "benchmark_json",
+        "stdout_log",
+        "stderr_log",
+        "labels",
+        "lockfile",
+        "validation_matrix"
+      ],
+      "properties": {
+        "benchmark_json": {"$ref": "#/$defs/artifact"},
+        "stdout_log": {"$ref": "#/$defs/artifact"},
+        "stderr_log": {"$ref": "#/$defs/artifact"},
+        "labels": {"$ref": "#/$defs/artifact"},
+        "lockfile": {"$ref": "#/$defs/artifact"},
+        "validation_matrix": {"$ref": "#/$defs/artifact"}
+      }
+    },
+    "validation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "validation_passed",
+        "semantic_oracle_run",
+        "backend_matrix_complete",
+        "compared_to_cuml",
+        "configuration_count",
+        "semantic_valid_configurations",
+        "oracle_random_seeds",
+        "semantic_checks",
+        "exact_partitions",
+        "ari_minimum",
+        "noise_agreement_minimum",
+        "independent_runs"
+      ],
+      "properties": {
+        "validation_passed": {"type": "boolean"},
+        "semantic_oracle_run": {"type": "boolean"},
+        "backend_matrix_complete": {"type": "boolean"},
+        "compared_to_cuml": {"type": "boolean"},
+        "configuration_count": {"type": "integer", "minimum": 1},
+        "semantic_valid_configurations": {"type": "integer", "minimum": 0},
+        "oracle_random_seeds": {"type": "integer", "minimum": 0},
+        "semantic_checks": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "core_membership",
+            "core_components",
+            "noise",
+            "border_assignments"
+          ],
+          "properties": {
+            "core_membership": {"type": "boolean"},
+            "core_components": {"type": "boolean"},
+            "noise": {"type": "boolean"},
+            "border_assignments": {"type": "boolean"}
+          }
+        },
+        "exact_partitions": {"type": ["integer", "null"], "minimum": 0},
+        "ari_minimum": {"type": ["number", "null"], "minimum": -1, "maximum": 1},
+        "noise_agreement_minimum": {"type": ["number", "null"], "minimum": 0, "maximum": 1},
+        "independent_runs": {"type": "integer", "minimum": 0}
+      }
+    },
+    "claims": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["scope", "limitations", "generalizable"],
+      "properties": {
+        "scope": {"type": "string", "minLength": 1},
+        "limitations": {
+          "type": "array",
+          "items": {"type": "string", "minLength": 1}
+        },
+        "generalizable": {"const": false}
+      }
+    },
+    "publication": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["ready", "project_license_status", "f2_provenance_status", "blockers"],
+      "properties": {
+        "ready": {"type": "boolean"},
+        "project_license_status": {"enum": ["unresolved", "resolved"]},
+        "f2_provenance_status": {
+          "enum": ["unresolved", "authorized", "independent-no-copy"]
+        },
+        "blockers": {
+          "type": "array",
+          "items": {"type": "string", "minLength": 1}
+        }
+      }
+    }
+  },
+  "$defs": {
+    "artifact": {
+      "oneOf": [
+        {"type": "null"},
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["path", "sha256"],
+          "properties": {
+            "path": {"type": "string", "minLength": 1},
+            "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+          }
+        }
+      ]
+    },
+    "artifactRequired": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "sha256"],
+      "properties": {
+        "path": {"type": "string", "minLength": 1},
+        "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "status": {"enum": ["reproducible", "publication-ready"]}
+        }
+      },
+      "then": {
+        "properties": {
+          "validation": {
+            "properties": {
+              "validation_passed": {"const": true},
+              "semantic_oracle_run": {"const": true},
+              "backend_matrix_complete": {"const": true},
+              "oracle_random_seeds": {"minimum": 10},
+              "semantic_checks": {
+                "properties": {
+                  "core_membership": {"const": true},
+                  "core_components": {"const": true},
+                  "noise": {"const": true},
+                  "border_assignments": {"const": true}
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {"properties": {"status": {"const": "publication-ready"}}},
+      "then": {
+        "properties": {
+          "repository": {
+            "properties": {
+              "dirty": {"const": false},
+              "tag": {"type": "string", "minLength": 1}
+            }
+          },
+          "upstream": {
+            "properties": {
+              "baseline_cuml_version": {"type": "string", "minLength": 1},
+              "cupy_version": {"type": "string", "minLength": 1},
+              "raft_version": {"type": "string", "minLength": 1},
+              "rmm_version": {"type": "string", "minLength": 1},
+              "cuvs_version": {"type": "string", "minLength": 1}
+            }
+          },
+          "environment": {
+            "properties": {
+              "gpu_model": {"type": "string", "minLength": 1},
+              "driver_version": {"type": "string", "minLength": 1},
+              "cuda_toolkit": {"type": "string", "minLength": 1},
+              "compute_capability": {"type": "string", "minLength": 1},
+              "python_version": {"type": "string", "minLength": 1},
+              "compiler": {"type": "string", "minLength": 1},
+              "build_command": {"type": "string", "minLength": 1}
+            }
+          },
+          "binary": {
+            "properties": {
+              "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+              "build_id": {"type": "string", "minLength": 1},
+              "git_sha": {"type": "string", "pattern": "^[0-9a-f]{7,40}$"},
+              "git_dirty": {"const": false},
+              "configured_backend": {"enum": ["cuvs", "codes"]},
+              "compiled_backends": {"minItems": 1}
+            }
+          },
+          "dataset": {
+            "properties": {
+              "seed": {"type": "integer"},
+              "points_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+              "labels_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+              "metadata_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+              "generator_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+              "generation_method": {"type": "string", "minLength": 1}
+            }
+          },
+          "protocol": {
+            "properties": {
+              "route_observed": {"enum": ["annotated", "dense", "mixed", "not-applicable"]}
+            }
+          },
+          "measurements": {
+            "properties": {
+              "multi_ms": {"type": "number", "exclusiveMinimum": 0},
+              "cuml_sequential_ms": {"type": "number", "exclusiveMinimum": 0},
+              "speedup": {"type": "number", "exclusiveMinimum": 0},
+              "multi_gain": {"type": "number", "exclusiveMinimum": 0},
+              "overhead": {"type": "number", "exclusiveMinimum": 0}
+            }
+          },
+          "artifacts": {
+            "properties": {
+              "benchmark_json": {"$ref": "#/$defs/artifactRequired"},
+              "stdout_log": {"$ref": "#/$defs/artifactRequired"},
+              "stderr_log": {"$ref": "#/$defs/artifactRequired"},
+              "labels": {"$ref": "#/$defs/artifactRequired"},
+              "lockfile": {"$ref": "#/$defs/artifactRequired"},
+              "validation_matrix": {"$ref": "#/$defs/artifactRequired"}
+            }
+          },
+          "publication": {
+            "properties": {
+              "ready": {"const": true},
+              "project_license_status": {"const": "resolved"},
+              "f2_provenance_status": {"enum": ["authorized", "independent-no-copy"]},
+              "blockers": {"maxItems": 0}
+            }
+          },
+          "validation": {
+            "properties": {
+              "validation_passed": {"const": true},
+              "semantic_oracle_run": {"const": true},
+              "backend_matrix_complete": {"const": true},
+              "compared_to_cuml": {"const": true},
+              "semantic_valid_configurations": {"type": "integer", "minimum": 1},
+              "oracle_random_seeds": {"minimum": 100},
+              "semantic_checks": {
+                "properties": {
+                  "core_membership": {"const": true},
+                  "core_components": {"const": true},
+                  "noise": {"const": true},
+                  "border_assignments": {"const": true}
+                }
+              },
+              "exact_partitions": {"type": "integer", "minimum": 0},
+              "ari_minimum": {"type": "number", "minimum": -1, "maximum": 1},
+              "noise_agreement_minimum": {"type": "number", "minimum": 0, "maximum": 1},
+              "independent_runs": {"minimum": 2}
+            }
+          }
+        }
+      }
+    }
+  ]
+}

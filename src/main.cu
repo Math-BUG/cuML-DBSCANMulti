@@ -4,8 +4,8 @@
  *
  * Executável CUDA do cuML-DBSCANMulti.
  *
- * Implementa o contrato de linha de comando do DBSCANMultiE, para reaproveitar o harness
- * de benchmark e validação já existente:
+ * Implementa o contrato de linha de comando documentado por este projeto, usado pelas
+ * ferramentas locais de benchmark e validação:
  *
  *   ./dbscan_multi --input points.f32 --output labels.i32 --n N --d D \
  *                  --eps E[,E2,...] --min-samples M[,M2,...] --json
@@ -19,10 +19,10 @@
  * valores de ε e l de minPts saem k*l configurações, em ordem eps-major
  * (config = e * l + m), como reportado no campo "config_order" do JSON.
  *
- * fit_ms cobre a chamada completa do algoritmo, incluindo a alocação do workspace, e
- * exclui leitura de arquivo e as transferências de entrada e saída. Com --repeat R é a
- * mediana de R execuções; --warmup W descarta as W primeiras, que pagam o carregamento do
- * módulo CUDA.
+ * fit_ms cobre somente a execução GPU com dados já residentes. O workspace cresce na
+ * primeira chamada e é reutilizado: com --warmup >= 1 sua alocação fica fora da medição;
+ * com --warmup 0 ela entra na primeira amostra. Leitura e transferências ficam fora. Com
+ * --repeat R é a mediana de R execuções.
  */
 
 #include "multi/runner_multi.cuh"
@@ -44,8 +44,31 @@
 #include <iostream>
 #include <random>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <vector>
+
+#ifndef DBSCANMULTI_GIT_SHA
+#define DBSCANMULTI_GIT_SHA "unknown"
+#endif
+#ifndef DBSCANMULTI_GIT_DIRTY
+#define DBSCANMULTI_GIT_DIRTY -1
+#endif
+#ifndef DBSCANMULTI_REVISION_KIND
+#define DBSCANMULTI_REVISION_KIND "unknown"
+#endif
+#ifndef DBSCANMULTI_BUILD_ID
+#define DBSCANMULTI_BUILD_ID "unknown"
+#endif
+#ifndef DBSCANMULTI_CUDA_ARCH
+#define DBSCANMULTI_CUDA_ARCH "unknown"
+#endif
+#ifndef DBSCANMULTI_BUILD_BACKEND
+#define DBSCANMULTI_BUILD_BACKEND "unknown"
+#endif
+#ifndef DBSCANMULTI_BUILD_FLAGS
+#define DBSCANMULTI_BUILD_FLAGS "unknown"
+#endif
 
 namespace {
 
@@ -65,18 +88,143 @@ struct Options {
   int repeat                      = 1;
   std::string backend             = "cuvs";
   std::string index               = "auto";
+  std::string route               = "auto";
   int neigh_per_row               = 0;
   bool solo                       = false;
   bool solo_isolado               = false;  // recria tudo por configuração (reprodutor)
   bool json                       = false;
   bool selftest                   = false;
   bool perfil                     = false;  // tempo por fase dentro do runner
+  bool build_info                 = false;
 };
+
+std::string json_escape(const std::string& value)
+{
+  std::ostringstream out;
+  for (const unsigned char c : value) {
+    switch (c) {
+      case '"': out << "\\\""; break;
+      case '\\': out << "\\\\"; break;
+      case '\b': out << "\\b"; break;
+      case '\f': out << "\\f"; break;
+      case '\n': out << "\\n"; break;
+      case '\r': out << "\\r"; break;
+      case '\t': out << "\\t"; break;
+      default:
+        if (c < 0x20) {
+          const char hex[] = "0123456789abcdef";
+          out << "\\u00" << hex[(c >> 4) & 0xf] << hex[c & 0xf];
+        } else {
+          out << static_cast<char>(c);
+        }
+    }
+  }
+  return out.str();
+}
+
+void write_build_json(std::ostream& out)
+{
+  out << "{\"git_sha\":\"" << json_escape(DBSCANMULTI_GIT_SHA)
+      << "\",\"revision_kind\":\"" << json_escape(DBSCANMULTI_REVISION_KIND)
+      << "\",\"git_dirty\":";
+  if (DBSCANMULTI_GIT_DIRTY == 0) {
+    out << "false";
+  } else if (DBSCANMULTI_GIT_DIRTY == 1) {
+    out << "true";
+  } else {
+    out << "null";
+  }
+  out << ",\"build_id\":\"" << json_escape(DBSCANMULTI_BUILD_ID)
+      << "\",\"cuda_arch\":\"" << json_escape(DBSCANMULTI_CUDA_ARCH)
+      << "\",\"configured_backend\":\"" << json_escape(DBSCANMULTI_BUILD_BACKEND)
+      << "\",\"compiled_backends\":[";
+#ifdef DBSCANMULTI_USE_CUVS
+  out << "\"cuvs\",\"codes\"";
+#else
+  out << "\"codes\"";
+#endif
+  out << "],\"flags\":\"" << json_escape(DBSCANMULTI_BUILD_FLAGS) << "\"}";
+}
+
+void write_cuda_runtime_json(std::ostream& out)
+{
+  int runtime_version = 0;
+  int driver_version  = 0;
+  int device          = -1;
+  cudaDeviceProp prop{};
+  const bool runtime_ok = cudaRuntimeGetVersion(&runtime_version) == cudaSuccess;
+  const bool driver_ok  = cudaDriverGetVersion(&driver_version) == cudaSuccess;
+  const bool device_ok  = cudaGetDevice(&device) == cudaSuccess &&
+                         cudaGetDeviceProperties(&prop, device) == cudaSuccess;
+
+  out << "{\"runtime_version\":" << (runtime_ok ? runtime_version : 0)
+      << ",\"driver_version\":" << (driver_ok ? driver_version : 0)
+      << ",\"device\":" << (device_ok ? device : -1);
+  if (device_ok) {
+    out << ",\"gpu_name\":\"" << json_escape(prop.name) << "\",\"compute_capability\":\""
+        << prop.major << "." << prop.minor << "\",\"total_global_memory\":"
+        << static_cast<unsigned long long>(prop.totalGlobalMem);
+  }
+  out << "}";
+}
+
+void write_argv_json(std::ostream& out, int argc, char** argv)
+{
+  out << "[";
+  for (int i = 0; i < argc; ++i) {
+    if (i != 0) out << ",";
+    out << "\"" << json_escape(argv[i] ? argv[i] : "") << "\"";
+  }
+  out << "]";
+}
+
+long long parse_integer(const std::string& raw, const char* flag)
+{
+  try {
+    std::size_t consumed = 0;
+    const long long value = std::stoll(raw, &consumed, 10);
+    if (consumed != raw.size()) throw std::invalid_argument("sufixo");
+    return value;
+  } catch (const std::exception&) {
+    std::cerr << "erro: " << flag << " exige um inteiro válido, recebi '" << raw << "'\n";
+    std::exit(2);
+  }
+}
+
+int parse_int_value(const std::string& raw, const char* flag)
+{
+  const long long value = parse_integer(raw, flag);
+  if (value < std::numeric_limits<int>::min() || value > std::numeric_limits<int>::max()) {
+    std::cerr << "erro: " << flag << " está fora do intervalo de int: '" << raw << "'\n";
+    std::exit(2);
+  }
+  return static_cast<int>(value);
+}
+
+float parse_float_value(const std::string& raw, const char* flag)
+{
+  try {
+    std::size_t consumed = 0;
+    const float value = std::stof(raw, &consumed);
+    if (consumed != raw.size() || !std::isfinite(value)) throw std::invalid_argument("não finito");
+    return value;
+  } catch (const std::exception&) {
+    std::cerr << "erro: " << flag << " exige um número finito válido, recebi '" << raw << "'\n";
+    std::exit(2);
+  }
+}
 
 /** Traduz o nome do backend, validando cedo para não falhar só na GPU. */
 ML::Dbscan::Multi::Backend parse_backend(const std::string& nome)
 {
-  if (nome == "cuvs") return ML::Dbscan::Multi::Backend::Cuvs;
+  if (nome == "cuvs") {
+#ifdef DBSCANMULTI_USE_CUVS
+    return ML::Dbscan::Multi::Backend::Cuvs;
+#else
+    std::cerr << "erro: este binário foi compilado sem cuVS; use --backend codes\n";
+    std::exit(2);
+#endif
+  }
   if (nome == "codes") return ML::Dbscan::Multi::Backend::Codes;
   std::cerr << "erro: --backend deve ser 'cuvs' ou 'codes', recebi '" << nome << "'\n";
   std::exit(2);
@@ -90,14 +238,18 @@ void print_usage()
        "                  --min-samples M[,M2,...]\n"
        "                  [--output labels.i32] [--max-mbytes-per-batch MB]\n"
        "                  [--backend cuvs|codes] [--index auto|int32|int64]\n"
+       "                  [--route auto|annotated|dense]\n"
        "                  [--warmup W] [--repeat R] [--json]\n"
        "     dbscan_multi --selftest [--backend cuvs|codes] [--json]\n"
+       "     dbscan_multi --build-info\n"
        "\n"
        "  --backend cuvs (padrão) usa a mesma busca de vizinhança do DBSCAN do cuML e faz\n"
        "  o multi-eps sobre o CSR dele; codes usa o kernel próprio, sem libcuvs.\n"
        "  --index auto (padrão) usa int64 quando N*N estoura int32 (N >= 46341), porque\n"
        "  int32 trava o tamanho do lote em MAX_INT/N e cada lote a mais custa uma rodada\n"
        "  de fusão de rótulos POR CONFIGURAÇÃO.\n"
+       "  --route força, apenas no backend cuvs, a rota multi-eps que anota/compacta o\n"
+       "  maior CSR ou a rota densa que reconstrói um CSR por raio. Use auto para medir.\n"
        "  --neigh-per-row V dimensiona o lote supondo V vizinhos por linha em vez do pior\n"
        "  caso N. É o parâmetro neigh_per_row do cuML, que o cuML não expõe. Reduz o número\n"
        "  de lotes; se V ficar muito abaixo do grau real, a alocação do CSR falha.\n"
@@ -118,30 +270,38 @@ void print_usage()
 
 std::vector<int> parse_int_list(const std::string& raw)
 {
+  if (raw.empty() || raw.front() == ',' || raw.back() == ',' || raw.find(",,") != std::string::npos) {
+    std::cerr << "erro: --min-samples contém um item vazio\n";
+    std::exit(2);
+  }
   std::vector<int> values;
   std::stringstream ss(raw);
   std::string item;
   while (std::getline(ss, item, ',')) {
-    if (!item.empty()) values.push_back(std::stoi(item));
+    if (!item.empty()) values.push_back(parse_int_value(item, "--min-samples"));
   }
   return values;
 }
 
 std::vector<float> parse_float_list(const std::string& raw)
 {
+  if (raw.empty() || raw.front() == ',' || raw.back() == ',' || raw.find(",,") != std::string::npos) {
+    std::cerr << "erro: --eps contém um item vazio\n";
+    std::exit(2);
+  }
   std::vector<float> values;
   std::stringstream ss(raw);
   std::string item;
   while (std::getline(ss, item, ',')) {
-    if (!item.empty()) values.push_back(std::stof(item));
+    if (!item.empty()) values.push_back(parse_float_value(item, "--eps"));
   }
   return values;
 }
 
 /**
  * Expande a faixa de ε. O limite máximo entra quando pertence à progressão: uma faixa não
- * divisível como 0,1..0,55 com passo 0,2 produz 0,1 / 0,3 / 0,5 — mesma regra do
- * DBSCANMultiE, para que os arquivos de configuração do harness continuem valendo.
+ * divisível como 0,1..0,55 com passo 0,2 produz 0,1 / 0,3 / 0,5. Essa regra faz parte do
+ * contrato de CLI documentado pelo projeto.
  */
 std::vector<float> expand_eps_range(float eps_min, float eps_max, float eps_step)
 {
@@ -182,32 +342,40 @@ bool parse_args(int argc, char** argv, Options& opt)
     } else if (arg == "--output") {
       opt.output = next("--output");
     } else if (arg == "--n") {
-      opt.n = std::stoi(next("--n"));
+      opt.n = parse_int_value(next("--n"), "--n");
     } else if (arg == "--d") {
-      opt.d = std::stoi(next("--d"));
+      opt.d = parse_int_value(next("--d"), "--d");
     } else if (arg == "--eps") {
       opt.eps      = parse_float_list(next("--eps"));
       has_eps_list = true;
     } else if (arg == "--eps-min") {
-      opt.eps_min        = std::stof(next("--eps-min"));
+      opt.eps_min        = parse_float_value(next("--eps-min"), "--eps-min");
       opt.has_eps_range  = true;
     } else if (arg == "--eps-max") {
-      opt.eps_max       = std::stof(next("--eps-max"));
+      opt.eps_max       = parse_float_value(next("--eps-max"), "--eps-max");
       opt.has_eps_range = true;
     } else if (arg == "--eps-step") {
-      opt.eps_step      = std::stof(next("--eps-step"));
+      opt.eps_step      = parse_float_value(next("--eps-step"), "--eps-step");
       opt.has_eps_range = true;
     } else if (arg == "--min-samples") {
       opt.min_samples = parse_int_list(next("--min-samples"));
     } else if (arg == "--max-mbytes-per-batch") {
-      opt.max_bytes_per_batch =
-        static_cast<std::size_t>(std::stoll(next("--max-mbytes-per-batch"))) * 1000000ull;
+      const long long mb = parse_integer(next("--max-mbytes-per-batch"),
+                                         "--max-mbytes-per-batch");
+      if (mb < 0 || static_cast<unsigned long long>(mb) >
+                      std::numeric_limits<std::size_t>::max() / 1000000ull) {
+        std::cerr << "erro: --max-mbytes-per-batch deve ser >= 0 e caber em size_t\n";
+        return false;
+      }
+      opt.max_bytes_per_batch = static_cast<std::size_t>(mb) * 1000000ull;
     } else if (arg == "--backend") {
       opt.backend = next("--backend");
     } else if (arg == "--index") {
       opt.index = next("--index");
+    } else if (arg == "--route") {
+      opt.route = next("--route");
     } else if (arg == "--neigh-per-row") {
-      opt.neigh_per_row = std::stoi(next("--neigh-per-row"));
+      opt.neigh_per_row = parse_int_value(next("--neigh-per-row"), "--neigh-per-row");
     } else if (arg == "--solo") {
       opt.solo = true;
     } else if (arg == "--perfil") {
@@ -216,13 +384,15 @@ bool parse_args(int argc, char** argv, Options& opt)
       opt.solo         = true;
       opt.solo_isolado = true;
     } else if (arg == "--warmup") {
-      opt.warmup = std::stoi(next("--warmup"));
+      opt.warmup = parse_int_value(next("--warmup"), "--warmup");
     } else if (arg == "--repeat") {
-      opt.repeat = std::stoi(next("--repeat"));
+      opt.repeat = parse_int_value(next("--repeat"), "--repeat");
     } else if (arg == "--json") {
       opt.json = true;
     } else if (arg == "--selftest") {
       opt.selftest = true;
+    } else if (arg == "--build-info") {
+      opt.build_info = true;
     } else if (arg == "--help" || arg == "-h") {
       print_usage();
       std::exit(0);
@@ -244,6 +414,10 @@ bool parse_args(int argc, char** argv, Options& opt)
   }
   if (opt.warmup < 0) {
     std::cerr << "erro: --warmup deve ser >= 0\n";
+    return false;
+  }
+  if (opt.neigh_per_row < 0) {
+    std::cerr << "erro: --neigh-per-row deve ser >= 0\n";
     return false;
   }
   if (opt.has_eps_range) opt.eps = expand_eps_range(opt.eps_min, opt.eps_max, opt.eps_step);
@@ -335,7 +509,8 @@ std::vector<int> fit_com_handle(const raft::handle_t& handle,
                                 int repeat,
                                 std::vector<float>& timings,
                                 rmm::device_uvector<char>* workspace = nullptr,
-                                ML::Dbscan::Multi::PerfilMulti* perfil = nullptr)
+                                ML::Dbscan::Multi::PerfilMulti* perfil = nullptr,
+                                ML::Dbscan::Multi::BuffersCsr<Index_>* buffers = nullptr)
 {
   cudaStream_t stream = handle.get_stream();
 
@@ -377,7 +552,8 @@ std::vector<int> fit_com_handle(const raft::handle_t& handle,
                                                 backend,
                                                 static_cast<Index_>(neigh_per_row),
                                                 workspace,
-                                                perfil);
+                                                perfil,
+                                                buffers);
   };
 
   for (int i = 0; i < warmup; ++i) {
@@ -409,6 +585,14 @@ std::vector<int> fit_com_handle(const raft::handle_t& handle,
   std::vector<Index_> raw(static_cast<std::size_t>(n) * n_cfg);
   raft::update_host(raw.data(), d_labels.data(), raw.size(), stream);
   handle.sync_stream(stream);
+  for (std::size_t i = 0; i < raw.size(); ++i) {
+    if (raw[i] < static_cast<Index_>(-1) || raw[i] >= static_cast<Index_>(n)) {
+      std::ostringstream message;
+      message << "rótulo CUDA inválido na posição " << i << ": " << raw[i]
+              << " (esperado -1 <= label < " << n << ")";
+      throw std::runtime_error(message.str());
+    }
+  }
   return std::vector<int>(raw.begin(), raw.end());
 }
 
@@ -441,6 +625,7 @@ std::vector<int> fit_impl(const std::vector<float>& host_points,
 {
   raft::handle_t handle;
   rmm::device_uvector<char> workspace(0, handle.get_stream());
+  ML::Dbscan::Multi::BuffersCsr<Index_> buffers(handle.get_stream());
   return fit_com_handle<Index_>(handle,
                                 host_points,
                                 n,
@@ -453,7 +638,9 @@ std::vector<int> fit_impl(const std::vector<float>& host_points,
                                 warmup,
                                 repeat,
                                 timings,
-                                reusar_workspace ? &workspace : nullptr);
+                                reusar_workspace ? &workspace : nullptr,
+                                /* perfil */ nullptr,
+                                reusar_workspace ? &buffers : nullptr);
 }
 
 /**
@@ -483,7 +670,7 @@ void fit_perfilado_impl(const std::vector<float>& host_points,
 enum class IndexType { Auto, Int32, Int64 };
 
 /**
- * O tamanho de lote do cuML é limitado por `MAX_LABEL / N`, porque o CSR de um lote indexa
+ * O tamanho de lote do cuML é limitado por `(MAX_LABEL - 1) / N`, porque o CSR de um lote indexa
  * `N * batch_size` elementos. Com int32 isso trava o lote assim que `N² >= INT_MAX`, ou
  * seja, a partir de N ≈ 46341 — e cada lote a mais significa recalcular a vizinhança na
  * segunda passagem e uma rodada extra de fusão de rótulos POR CONFIGURAÇÃO. É o mesmo
@@ -506,6 +693,16 @@ IndexType parse_index_type(const std::string& nome)
   if (nome == "int32") return IndexType::Int32;
   if (nome == "int64") return IndexType::Int64;
   std::cerr << "erro: --index deve ser 'auto', 'int32' ou 'int64', recebi '" << nome << "'\n";
+  std::exit(2);
+}
+
+int parse_route_type(const std::string& nome)
+{
+  if (nome == "auto") return 0;
+  if (nome == "annotated") return 1;
+  if (nome == "dense") return 2;
+  std::cerr << "erro: --route deve ser 'auto', 'annotated' ou 'dense', recebi '" << nome
+            << "'\n";
   std::exit(2);
 }
 
@@ -600,6 +797,9 @@ void medir_solo_impl(const std::vector<float>& points,
   // chamador em laço deveria fazer.
   raft::handle_t handle;
   rmm::device_uvector<char> workspace(0, handle.get_stream());
+  // Os buffers do CSR (adj_graph, adj_graph_f, codes) somam mais que o workspace em dados
+  // densos — 20 GB contra 3,8 GB — e também precisam sobreviver ao laço.
+  ML::Dbscan::Multi::BuffersCsr<Index_> buffers(handle.get_stream());
 
   for (std::size_t e = 0; e < eps.size(); ++e) {
     for (std::size_t m = 0; m < min_samples.size(); ++m) {
@@ -610,7 +810,8 @@ void medir_solo_impl(const std::vector<float>& points,
       if (handle_unico) {
         // Handle e workspace compartilhados: é assim que se deve chamar em laço.
         fit_com_handle<Index_>(handle, points, n, d, eps1, mp1, max_bytes_per_batch,
-                               backend, neigh_per_row, warmup, repeat, t, &workspace);
+                               backend, neigh_per_row, warmup, repeat, t, &workspace,
+                               /* perfil */ nullptr, &buffers);
       } else {
         // Tudo novo a cada configuração, para reproduzir o comportamento antigo.
         fit_impl<Index_>(points, n, d, eps1, mp1, max_bytes_per_batch, backend,
@@ -656,6 +857,20 @@ std::string join(const std::vector<T>& values)
   }
   return os.str();
 }
+
+/** Restaura um knob de teste mesmo se uma chamada CUDA lançar uma exceção. */
+template <typename T>
+class ScopedValue {
+ public:
+  ScopedValue(T& target, T value) : target_(target), previous_(target) { target_ = value; }
+  ~ScopedValue() { target_ = previous_; }
+  ScopedValue(const ScopedValue&)            = delete;
+  ScopedValue& operator=(const ScopedValue&) = delete;
+
+ private:
+  T& target_;
+  T previous_;
+};
 
 /** Número de clusters e de pontos de ruído de uma configuração. */
 void summarize(const std::vector<int>& labels,
@@ -716,6 +931,11 @@ std::vector<int> canonicalize(const std::vector<int>& labels, int n, std::size_t
   int proximo = 0;
   for (int i = 0; i < n; ++i) {
     if (p[i] < 0) continue;
+    if (p[i] >= n) {
+      // `fit_com_handle` rejeita isto antes de chegar aqui. A guarda mantém o helper
+      // seguro caso ele venha a ser reutilizado diretamente em outro teste.
+      throw std::out_of_range("canonicalize recebeu rótulo fora de [0, N)");
+    }
     if (mapa[static_cast<std::size_t>(p[i])] < 0) mapa[static_cast<std::size_t>(p[i])] = proximo++;
     out[static_cast<std::size_t>(i)] = mapa[static_cast<std::size_t>(p[i])];
   }
@@ -771,6 +991,55 @@ int run_selftest(bool json, ML::Dbscan::Multi::Backend backend)
   }
 
   bool ok = true;
+
+  // No build cuVS os dois caminhos estão disponíveis no mesmo executável. Compará-los
+  // aqui evita o falso conforto de dois selftests independentes que nunca confrontam os
+  // vetores produzidos. Três execuções também detectam instabilidade do backend codes.
+  bool backend_comparison_performed = false;
+  int backend_mismatches            = 0;
+  int backend_repeat_mismatches     = 0;
+#ifdef DBSCANMULTI_USE_CUVS
+  if (use_cuvs) {
+    backend_comparison_performed = true;
+    const std::size_t n_cfg       = static_cast<std::size_t>(k) * l;
+    std::vector<bool> mismatch(n_cfg, false);
+    std::vector<bool> repeat_mismatch(n_cfg, false);
+    std::vector<int> codes_reference;
+    for (int repetition = 0; repetition < 3; ++repetition) {
+      std::vector<float> codes_timings;
+      const std::vector<int> codes_labels = fit(points,
+                                                n,
+                                                d,
+                                                eps,
+                                                min_samples,
+                                                0,
+                                                ML::Dbscan::Multi::Backend::Codes,
+                                                IndexType::Int32,
+                                                0,
+                                                0,
+                                                1,
+                                                codes_timings);
+      for (std::size_t config = 0; config < n_cfg; ++config) {
+        if (canonicalize(labels, n, config) != canonicalize(codes_labels, n, config)) {
+          mismatch[config] = true;
+        }
+        if (repetition > 0 &&
+            canonicalize(codes_reference, n, config) != canonicalize(codes_labels, n, config)) {
+          repeat_mismatch[config] = true;
+        }
+      }
+      if (repetition == 0) codes_reference = codes_labels;
+    }
+    backend_mismatches = static_cast<int>(std::count(mismatch.begin(), mismatch.end(), true));
+    backend_repeat_mismatches =
+      static_cast<int>(std::count(repeat_mismatch.begin(), repeat_mismatch.end(), true));
+    if (backend_mismatches != 0 || backend_repeat_mismatches != 0) ok = false;
+    std::cerr << "[selftest] backends: " << (n_cfg - backend_mismatches) << "/" << n_cfg
+              << " configurações idênticas entre cuVS e codes; "
+              << (n_cfg - backend_repeat_mismatches) << "/" << n_cfg
+              << " determinísticas em 3 execuções codes\n";
+  }
+#endif
 
   // O maior ε com o menor minPts deve enxergar os três blobs.
   const std::size_t easiest = static_cast<std::size_t>(k - 1) * l + 0;
@@ -891,6 +1160,58 @@ int run_selftest(bool json, ML::Dbscan::Multi::Backend backend)
     std::cerr << "[selftest] D=" << dt << (dim_ok ? " ok" : " FALHOU") << " para k = 1, 3 e 5\n";
   }
 
+  // --- parte 3b: fallback sem shared memory em dimensão muito alta ----------
+  // float32 em D=8193 já exige mais de 32 KiB até para uma única coluna do tile. A
+  // geometria usa só as duas primeiras coordenadas; portanto D=33 e D=8193 devem gerar
+  // exatamente a mesma partição no backend codes.
+  const int n_pc_high = 16;
+  const int n_high    = 3 * n_pc_high;
+  // Cinco raios exercitam a especialização MAX_K=16 também no fallback; testar apenas
+  // k=1 deixaria justamente os vetores de códigos multiparamétricos fora desta cobertura.
+  const std::vector<float> eps_high{0.5f, 1.0f, 2.0f, 3.0f, 4.0f};
+  const std::vector<int> min_pts_high{2};
+  std::vector<float> high_timing_ref;
+  std::vector<float> high_timing_fallback;
+  const std::vector<int> high_ref = fit(make_blobs(n_pc_high, 33),
+                                        n_high,
+                                        33,
+                                        eps_high,
+                                        min_pts_high,
+                                        0,
+                                        ML::Dbscan::Multi::Backend::Codes,
+                                        IndexType::Int32,
+                                        0,
+                                        0,
+                                        1,
+                                        high_timing_ref);
+  const int high_d = ML::Dbscan::Multi::VertexDeg::kTileSharedBytes /
+                       static_cast<int>(sizeof(float)) +
+                     1;
+  const std::vector<int> high_fallback = fit(make_blobs(n_pc_high, high_d),
+                                             n_high,
+                                             high_d,
+                                             eps_high,
+                                             min_pts_high,
+                                             0,
+                                             ML::Dbscan::Multi::Backend::Codes,
+                                             IndexType::Int32,
+                                             0,
+                                             0,
+                                             1,
+                                             high_timing_fallback);
+  int high_dim_mismatches = 0;
+  for (std::size_t config = 0; config < eps_high.size() * min_pts_high.size(); ++config) {
+    if (canonicalize(high_ref, n_high, config) !=
+        canonicalize(high_fallback, n_high, config)) {
+      ++high_dim_mismatches;
+    }
+  }
+  if (high_dim_mismatches != 0) ok = false;
+  std::cerr << "[selftest] alta dimensão codes: "
+            << (high_dim_mismatches == 0 ? "idêntico" : "DIVERGENTE") << " em "
+            << (eps_high.size() - static_cast<std::size_t>(high_dim_mismatches)) << "/"
+            << eps_high.size() << " configurações entre D=33 e D=" << high_d << "\n";
+
   // --- parte 4: tipo de índice ----------------------------------------------
   // int64 existe para destravar o tamanho do lote (int32 o limita a MAX_INT/N), e com
   // N grande é o caminho padrão. O tipo do índice é detalhe de representação: os rótulos
@@ -928,18 +1249,16 @@ int run_selftest(bool json, ML::Dbscan::Multi::Backend backend)
   // plausível, e folgado o bastante para o lote corrigido ficar na casa das dezenas de
   // linhas. Um teto muito menor levaria o pior caso a lotes de 1 linha e o teste passaria
   // a gastar minutos em 3000 fusões de rótulos.
-  const std::size_t teto_anterior = ML::Dbscan::Multi::csr_teto_de_teste();
-  ML::Dbscan::Multi::csr_correcoes_de_lote() = 0;
-  ML::Dbscan::Multi::csr_teto_de_teste()     = 1024u * 1024u;
-
   std::vector<float> timings_ajuste;
-  const std::vector<int> labels_ajuste =
-    fit(points, n, d, eps, min_samples, 0, backend, IndexType::Int32,
-        /* neigh_per_row */ 1, 0, 1, timings_ajuste);
-
-  ML::Dbscan::Multi::csr_teto_de_teste() = teto_anterior;
-
-  const int correcoes = ML::Dbscan::Multi::csr_correcoes_de_lote();
+  std::vector<int> labels_ajuste;
+  int correcoes = 0;
+  {
+    ScopedValue<std::size_t> teto_guard(ML::Dbscan::Multi::csr_teto_de_teste(), 1024u * 1024u);
+    ScopedValue<int> correcoes_guard(ML::Dbscan::Multi::csr_correcoes_de_lote(), 0);
+    labels_ajuste = fit(points, n, d, eps, min_samples, 0, backend, IndexType::Int32,
+                        /* neigh_per_row */ 1, 0, 1, timings_ajuste);
+    correcoes = ML::Dbscan::Multi::csr_correcoes_de_lote();
+  }
   if (correcoes == 0) {
     std::cerr << "[selftest] FALHA: o teto apertado não obrigou nenhuma correção de lote; "
                  "o teste não exercitou nada\n";
@@ -967,27 +1286,44 @@ int run_selftest(bool json, ML::Dbscan::Multi::Backend backend)
   // fazia o multi perder para o cuML. Os rótulos têm de ser os mesmos nas duas.
   //
   // Sem forçar, o dataset do teste escolheria uma só e a outra nunca rodaria.
-  std::vector<int> labels_rota[2];
-  for (int rota = 1; rota <= 2; ++rota) {
-    ML::Dbscan::Multi::rota_forcada() = rota;
-    std::vector<float> t_rota;
-    labels_rota[rota - 1] = fit(points, n, d, eps, min_samples, 0, backend, IndexType::Int32,
-                                0, 0, 1, t_rota);
-  }
-  ML::Dbscan::Multi::rota_forcada() = 0;
-
   int divergentes_rota = 0;
-  for (std::size_t config = 0; config < static_cast<std::size_t>(k) * l; ++config) {
-    if (canonicalize(labels_rota[0], n, config) != canonicalize(labels_rota[1], n, config)) {
-      ++divergentes_rota;
-      std::cerr << "[selftest] FALHA: config " << config
-                << " diverge entre a rota que anota e a rota densa\n";
-      ok = false;
+  const bool route_tested = use_cuvs;
+  if (route_tested) {
+    std::vector<int> labels_rota[2];
+    {
+      ScopedValue<int> rota_guard(ML::Dbscan::Multi::rota_forcada(), 0);
+      for (int rota = 1; rota <= 2; ++rota) {
+        ML::Dbscan::Multi::rota_forcada() = rota;
+        std::vector<float> t_rota;
+        labels_rota[rota - 1] = fit(points,
+                                    n,
+                                    d,
+                                    eps,
+                                    min_samples,
+                                    0,
+                                    backend,
+                                    IndexType::Int32,
+                                    0,
+                                    0,
+                                    1,
+                                    t_rota);
+      }
     }
+
+    for (std::size_t config = 0; config < static_cast<std::size_t>(k) * l; ++config) {
+      if (canonicalize(labels_rota[0], n, config) != canonicalize(labels_rota[1], n, config)) {
+        ++divergentes_rota;
+        std::cerr << "[selftest] FALHA: config " << config
+                  << " diverge entre a rota que anota e a rota densa\n";
+        ok = false;
+      }
+    }
+    std::cerr << "[selftest] rotas: " << (static_cast<std::size_t>(k) * l - divergentes_rota)
+              << "/" << (static_cast<std::size_t>(k) * l)
+              << " configurações idênticas entre anotar-e-compactar e um CSR por raio\n";
+  } else {
+    std::cerr << "[selftest] rotas: não aplicável ao backend codes\n";
   }
-  std::cerr << "[selftest] rotas: " << (static_cast<std::size_t>(k) * l - divergentes_rota) << "/"
-            << (static_cast<std::size_t>(k) * l)
-            << " configuracoes identicas entre anotar-e-compactar e um CSR por raio\n";
 
   std::cerr << "[selftest] " << (ok ? "PASSOU" : "FALHOU") << "\n";
 
@@ -1004,7 +1340,17 @@ int run_selftest(bool json, ML::Dbscan::Multi::Backend backend)
               << ",\"index_mismatches\":" << divergentes_i64
               << ",\"batch_fixup_mismatches\":" << divergentes_ajuste
               << ",\"route_mismatches\":" << divergentes_rota
-              << ",\"configurations\":[" << configs.str() << "]}" << std::endl;
+              << ",\"route_tested\":" << (route_tested ? "true" : "false")
+              << ",\"backend_comparison_performed\":"
+              << (backend_comparison_performed ? "true" : "false")
+              << ",\"backend_mismatches\":" << backend_mismatches
+              << ",\"backend_repeat_mismatches\":" << backend_repeat_mismatches
+              << ",\"high_dim_mismatches\":" << high_dim_mismatches
+              << ",\"configurations\":[" << configs.str() << "],\"build\":";
+    write_build_json(std::cout);
+    std::cout << ",\"cuda\":";
+    write_cuda_runtime_json(std::cout);
+    std::cout << "}" << std::endl;
   }
   return ok ? 0 : 1;
 }
@@ -1016,10 +1362,29 @@ int main(int argc, char** argv)
   Options opt;
   if (!parse_args(argc, argv, opt)) return 2;
 
+  if (opt.build_info) {
+    std::cout << "{\"build\":";
+    write_build_json(std::cout);
+    std::cout << "}" << std::endl;
+    return 0;
+  }
+
   const ML::Dbscan::Multi::Backend backend = parse_backend(opt.backend);
   const IndexType index_type               = parse_index_type(opt.index);
+  const int route_type                     = parse_route_type(opt.route);
+
+  if (route_type != 0 && !ML::Dbscan::Multi::backend_uses_cuvs(backend)) {
+    std::cerr << "erro: --route só se aplica ao backend cuvs\n";
+    return 2;
+  }
+  if (opt.selftest && route_type != 0) {
+    std::cerr << "erro: --route não deve ser combinado com --selftest; o teste força as duas rotas\n";
+    return 2;
+  }
 
   if (opt.selftest) return run_selftest(opt.json, backend);
+
+  ML::Dbscan::Multi::rota_forcada() = route_type;
 
   if (opt.input.empty() || opt.n <= 0 || opt.d <= 0 || opt.eps.empty() ||
       opt.min_samples.empty()) {
@@ -1031,8 +1396,17 @@ int main(int argc, char** argv)
   normalize_list(opt.eps, "--eps");
   normalize_list(opt.min_samples, "--min-samples");
 
-  if (opt.eps.front() <= 0.0f) {
-    std::cerr << "erro: valores de eps devem ser positivos\n";
+  const float largest_safe_eps = std::sqrt(std::numeric_limits<float>::max());
+  if (std::any_of(opt.eps.begin(), opt.eps.end(), [largest_safe_eps](float value) {
+        return !std::isfinite(value) || value <= 0.0f || value > largest_safe_eps;
+      })) {
+    std::cerr << "erro: valores de eps devem ser finitos, positivos e não estourar eps²\n";
+    return 2;
+  }
+  if (std::any_of(opt.min_samples.begin(), opt.min_samples.end(), [](int value) {
+        return value <= 0;
+      })) {
+    std::cerr << "erro: valores de min-samples devem ser positivos\n";
     return 2;
   }
   if (opt.eps.size() > static_cast<std::size_t>(ML::Dbscan::Multi::VertexDeg::kMaxEps)) {
@@ -1042,6 +1416,10 @@ int main(int argc, char** argv)
   }
 
   const std::vector<float> points = read_points(opt.input, opt.n, opt.d);
+  if (std::any_of(points.begin(), points.end(), [](float value) { return !std::isfinite(value); })) {
+    std::cerr << "erro: o arquivo de entrada contém NaN ou infinito\n";
+    return 2;
+  }
 
   std::vector<float> timings;
   const std::vector<int> labels = fit(points,
@@ -1056,6 +1434,8 @@ int main(int argc, char** argv)
                                       opt.warmup,
                                       opt.repeat,
                                       timings);
+  const ML::Dbscan::Multi::ExecutionStats execution_stats =
+    ML::Dbscan::Multi::last_execution_stats();
   const float fit_ms            = median_of(timings);
 
   if (!opt.output.empty()) write_labels(opt.output, labels);
@@ -1195,6 +1575,16 @@ int main(int argc, char** argv)
 
   if (opt.json) {
     const std::size_t n_cfg = opt.eps.size() * opt.min_samples.size();
+    const char* route_observed = "unknown";
+    if (!ML::Dbscan::Multi::backend_uses_cuvs(backend) || opt.eps.size() <= 1) {
+      route_observed = "not-applicable";
+    } else if (execution_stats.annotated_batches > 0 && execution_stats.dense_batches > 0) {
+      route_observed = "mixed";
+    } else if (execution_stats.annotated_batches > 0) {
+      route_observed = "annotated";
+    } else if (execution_stats.dense_batches > 0) {
+      route_observed = "dense";
+    }
     std::cout << "{\"fit_ms\":" << fit_ms << ",\"fit_ms_all\":[" << join(timings)
               << "],\"backend\":\"" << (ML::Dbscan::Multi::backend_uses_cuvs(backend) ? "cuvs"
                                                                                       : "codes")
@@ -1209,6 +1599,35 @@ int main(int argc, char** argv)
       std::cout << ",\"solo_ms\":[" << join(solo_ms) << "],\"solo_ms_all\":[" << solo_all.str()
                 << "]";
     }
+    std::cout << ",\"input\":\"" << json_escape(opt.input)
+              << "\",\"input_bytes\":"
+              << (static_cast<unsigned long long>(opt.n) * static_cast<unsigned long long>(opt.d) *
+                  sizeof(float))
+              << ",\"max_bytes_per_batch\":"
+              << static_cast<unsigned long long>(opt.max_bytes_per_batch)
+              << ",\"requested_index\":\"" << json_escape(opt.index)
+              << "\",\"requested_route\":\"" << json_escape(opt.route)
+              << "\",\"execution\":{\"effective_max_bytes_per_batch\":"
+              << static_cast<unsigned long long>(execution_stats.max_bytes_per_batch)
+              << ",\"batch_size\":" << execution_stats.batch_size
+              << ",\"batches\":" << execution_stats.batches
+              << ",\"attempts\":" << execution_stats.attempts
+              << ",\"batch_corrections\":" << execution_stats.batch_corrections
+              << ",\"dense_batches\":" << execution_stats.dense_batches
+              << ",\"annotated_batches\":" << execution_stats.annotated_batches
+              << ",\"route_observed\":\"" << route_observed << "\""
+              << ",\"stats_scope\":\"last_measured_repeat\""
+              << ",\"max_nnz\":" << execution_stats.max_nnz
+              << ",\"total_nnz_max_eps\":" << execution_stats.total_nnz_max_eps
+              << ",\"mean_degree_max_eps\":"
+              << (opt.n > 0 ? static_cast<double>(execution_stats.total_nnz_max_eps) / opt.n
+                            : 0.0)
+              << "},\"build\":";
+    write_build_json(std::cout);
+    std::cout << ",\"cuda\":";
+    write_cuda_runtime_json(std::cout);
+    std::cout << ",\"argv\":";
+    write_argv_json(std::cout, argc, argv);
     std::cout << "}" << std::endl;
   }
   return 0;

@@ -1,7 +1,5 @@
 #!/bin/bash
 #SBATCH --job-name=dbscanmulti_protocolo
-#SBATCH --mail-type=ALL
-#SBATCH --mail-user=matheus.antony@ufv.br
 #SBATCH --partition=scientific
 #SBATCH --qos=scientific-qos
 #SBATCH --nodes=1
@@ -47,6 +45,9 @@ export MKL_NUM_THREADS="${SLURM_CPUS_PER_TASK:-8}"
 PROJECT_DIR="${SLURM_SUBMIT_DIR:-$(pwd)}"
 cd "$PROJECT_DIR"
 
+# shellcheck disable=SC1091
+source scripts/setup_job_tmp.sh
+
 VENV_DIR="${VENV_DIR:-.venv}"
 [ -f "$VENV_DIR/bin/activate" ] || { echo "erro: venv não encontrado em '$VENV_DIR'" >&2; exit 1; }
 # shellcheck disable=SC1090
@@ -55,7 +56,7 @@ source "$VENV_DIR/bin/activate"
 # Datasets e resultados vao para a particao de dados (~/dados), nao para a HOME: a suite
 # completa passa de 2 GB, e mais ainda se entrarem N de 512k e 1M. Sobrepondo:
 #   sbatch --export=ALL,DATA_DIR=/outro/caminho ...
-DBM_BASE="${DBM_BASE:-$HOME/dados/dbscanmulti}"
+DBM_BASE="${DBM_BASE:-$HOME/dados/dbscanmulti/knn-sample-rank-v2}"
 DATA_DIR="${DATA_DIR:-$DBM_BASE/data}"
 RESULTS_DIR="${RESULTS_DIR:-$DBM_BASE/results}"
 mkdir -p "$DATA_DIR" "$RESULTS_DIR"
@@ -68,18 +69,35 @@ REPEAT="${REPEAT:-5}"
 NEIGH_PER_ROW="${NEIGH_PER_ROW:-512}"
 
 COMPUTE_CAP="$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader | head -n1 | tr -d '.')"
-echo "--- build (sm_${COMPUTE_CAP:-80}) ---"
-make CUDA_ARCH="sm_${COMPUTE_CAP:-80}" LINK_RAFT="${LINK_RAFT:-1}"
+CUDA_ARCH="sm_${COMPUTE_CAP:-80}"
+# Vazio deriva 70% da memória livre; NATIVE_AUTO_MEMORY=1 reproduz o auto histórico.
+MAX_MBYTES_PER_BATCH="$(bash scripts/resolve_memory_budget.sh)"
+echo "--- build (${CUDA_ARCH}) ---"
+echo "max_mbytes_per_batch: $MAX_MBYTES_PER_BATCH"
+BUILD_ARGS=(CUDA_ARCH="$CUDA_ARCH" STD="${STD:-c++17}"
+            BACKEND="${BACKEND:-cuvs}" LINK_RAFT="${LINK_RAFT:-1}")
+make "${BUILD_ARGS[@]}"
+BINARIO="$(make --no-print-directory -s print-target "${BUILD_ARGS[@]}")"
+echo "binario: $BINARIO"
+IDENTITY_JSON="${BINARIO}.identity.${SLURM_JOB_ID:-local}.json"
+python scripts/check_binary_identity.py --binary "$BINARIO" \
+  --backend "${BACKEND:-cuvs}" --cuda-arch "$CUDA_ARCH" --require-identified \
+  > "$IDENTITY_JSON"
+echo "identidade: $IDENTITY_JSON"
 
 META="$DATA_DIR/${DATASET}_n${N}.json"
 if [ ! -f "$META" ]; then
   echo "--- gerando ${DATASET} N=${N} ---"
   python tools/gerar_datasets.py --dataset "$DATASET" --n "$N" --out-dir "$DATA_DIR" >/dev/null
 fi
+python tools/gerar_datasets.py --validar-meta "$META" \
+  --dataset "$DATASET" --n "$N" >/dev/null
 
 TAG="${SLURM_JOB_ID:-local}"
 
-comum=(--meta "$META" --repeat "$REPEAT" --neigh-per-row "$NEIGH_PER_ROW" --imposto)
+comum=(--binario "$BINARIO" --backend "${BACKEND:-cuvs}"
+       --max-mbytes-per-batch "$MAX_MBYTES_PER_BATCH"
+       --meta "$META" --repeat "$REPEAT" --neigh-per-row "$NEIGH_PER_ROW" --imposto)
 
 echo ""
 echo "=============== A: um processo por configuração (referência) ==============="
@@ -91,11 +109,12 @@ EPS_META="$(python -c "import json;print(','.join(f'{v:.10g}' for v in json.load
 MP_META="$(python -c "import json;print(','.join(str(v) for v in json.load(open('$META'))['min_samples']))")"
 
 solo_direto() {  # $1 = flag extra, $2 = arquivo de saída
-  "${BINARIO:-./build/dbscan_multi}" \
+  "$BINARIO" \
     --input "$DATA_DIR/${DATASET}_n${N}.f32" --n "$N" --d "$D_META" \
     --eps "$EPS_META" --min-samples "$MP_META" \
+    --max-mbytes-per-batch "$MAX_MBYTES_PER_BATCH" \
     --repeat "$REPEAT" --warmup 1 --neigh-per-row "$NEIGH_PER_ROW" \
-    "$1" --json | tail -1 > "$2"
+    --backend "${BACKEND:-cuvs}" "$1" --json | tail -1 > "$2"
   echo "gravado em $2"
 }
 

@@ -12,7 +12,7 @@ exata, sob qual licença, o que será reaproveitado, o que será modificado e o 
 fora de escopo. Serve como base de rastreabilidade para o artigo e para a auditoria de
 reprodutibilidade.
 
-Última atualização: 2026-08-04.
+Última atualização: 2026-08-10.
 
 ---
 
@@ -102,20 +102,27 @@ refém da qualidade do kernel novo.
 
 A solução que preserva o cuML explora a monotonicidade do raio **depois** da busca, sobre o
 CSR que o `AdjGraph` já constrói. Vizinho sob um raio menor é vizinho sob todos os maiores,
-logo o CSR do **maior** ε contém todos os pares de que qualquer ε menor precisa:
+logo o CSR do **maior** ε contém todos os pares de que qualquer ε menor precisa. A
+implementação começa pela busca no maior raio e, com o `nnz` medido, escolhe uma rota por
+lote:
 
 1. `cuvs::…::compute` roda **uma vez**, no maior ε — chamada idêntica à do cuML;
 2. `AdjGraph::run` do cuML produz o CSR do lote, sem alteração;
-3. cada entrada do CSR é anotada com `e* = min{e : d ≤ ε_e}` — custo **O(nnz·D)**, porque
-   só pares que já são vizinhos são visitados, não O(N²·D);
-4. `vd[e][i]` sai do prefixo do histograma dos códigos da linha *i*, de graça no passo 3;
-5. o CSR de cada ε menor sai por **compactação** das entradas com `código ≤ e` — O(nnz),
-   sem nenhuma distância recalculada;
-6. etapas 4–5 do fluxo original rodam por configuração, intocadas.
+3. se `anotar_compensa(nnz, N·lote, k, D)`, cada entrada do CSR é anotada com
+   `e* = min{e : d ≤ ε_e}` — custo **O(nnz·D)**, porque só pares já vizinhos são visitados;
+4. nessa rota, `vd[e][i]` sai do prefixo do histograma e o CSR menor sai por compactação
+   das entradas com `código ≤ e`, O(nnz) por raio, sem nova busca;
+5. se o lote é denso, o acesso aleatório da anotação deixa de compensar: o resultado já
+   calculado para o maior ε é reutilizado e o cuVS calcula os demais raios, totalizando
+   uma chamada por ε; cada CSR é construído diretamente;
+6. as etapas de conectividade e fusão rodam por configuração nas duas rotas.
 
-Com *k* = 1 os passos 3–5 desaparecem e o caminho é, kernel a kernel, o do cuML. O ganho é
-a razão entre N²·D e nnz·D, e vale enquanto o maior ε for seletivo — se `nnz → N²`, a
-anotação custa uma passagem completa, mas nesse regime todo ponto é vizinho de todos.
+Com *k* = 1 os passos multi-ε desaparecem; com *l* = 1 e backend cuVS, o caminho algorítmico
+fica alinhado ao cuML. A equivalência de tempo ainda depende das mesmas escolhas efetivas de
+índice, orçamento e batching; a API Python fixa `int32`, usa política automática própria e
+não expõe o orçamento efetivo. No regime seletivo, a rota anotada troca buscas O(N²·D) por
+trabalho O(nnz·D). Quando `nnz → N²`, a decisão adaptativa pode preferir as *k* buscas cuVS;
+nenhum resultado deve presumir busca sempre compartilhada ou protocolo de memória idêntico.
 
 O kernel próprio de múltiplos raios (`src/multi/eps_neighborhood.cuh`, `--backend codes`)
 foi mantido como backend alternativo: compila sem `libcuvs` e serve de segunda
@@ -163,7 +170,7 @@ precisão float32, `algorithm="brute"`), senão a comparação mede coisas difer
 
 | Opção | Descrição | Custo | Entrega |
 |-------|-----------|-------|---------|
-| **A (recomendada)** | *Vendorizar* `cpp/src/dbscan/*` no repo, compilar com `nvcc` num binário próprio, usando apenas cabeçalhos de RAFT/RMM (o alvo `raft::raft` é *header-only*) | Baixo — minutos | Binário CLI, compatível com o contrato de F2 |
+| **A (recomendada)** | *Vendorizar* `cpp/src/dbscan/*` no repo e compilar com `nvcc` contra RAFT/RMM/cuVS/rapids_logger | Baixo — minutos | Binário CLI, compatível com o contrato de F2 |
 | **B** | Compilar `libcuml++` completo com o DBSCAN modificado + *binding* Python | Alto — build longo no cluster, resolução de dependências RAPIDS | `cuml.cluster.DBSCAN` com `fit_multi` |
 
 **Viabilidade da opção A — confirmada pela auditoria de `#include` da árvore vendorizada.**
@@ -171,15 +178,16 @@ A única dependência compilada pesada é o **cuVS**, e ela aparece em **exatame
 arquivos**: `vertexdeg/algo.cuh` (`epsilon_neighborhood::compute`) e `runner.cuh` (índice
 `ball_cover` do caminho RBC, fora de escopo). O restante do que se usa —
 `raft::sparse::convert::adj_to_csr`, `raft::sparse::weak_cc_batched`,
-`raft::label::make_monotonic`, `raft::linalg::*`, `rmm::device_uvector` — é *header-only*
-(RAFT), mas **RMM e rapids_logger não são**: `librmm.so` e `librapids_logger.so` entram no
-link.
+`raft::label::make_monotonic`, `raft::linalg::*`, `rmm::device_uvector`. RMM não é
+*header-only*: `librmm.so` entra no link. O shim local substitui o logger gerado pelo CMake
+do cuML, mas `raft/core/logger.hpp` ainda exige os headers e a biblioteca de
+`rapids-logger`.
 
 O cuVS **permanece no build**, de propósito: é ele que faz a busca de vizinhança, e
-reaproveitá-lo é o ponto do trabalho. Ele vem no wheel `libcuvs-cu12`, dependência do
-`cuml-cu12` que o baseline já exige, então não custa nada de infraestrutura. O
-`--backend codes` existe para o caso de o cuVS não estar disponível, e aí a árvore compila
-só com RAFT/RMM.
+reaproveitá-lo é o ponto do trabalho. O wheel `libcuvs-cu12` é instalado explicitamente em
+`requirements-cuml.txt`, na mesma série 26.02; não é necessário compilar cuVS a partir da
+fonte. O `--backend codes` existe para o caso de cuVS não estar disponível, e aí a árvore
+compila sem cuVS, mas ainda com RAFT/RMM/rapids_logger.
 
 Dois detalhes de compatibilidade já levantados:
 
@@ -204,16 +212,18 @@ Não é opcional e deve estar resolvido antes de publicar o repositório:
 
 1. ✅ Cópia da licença Apache-2.0 incluída em `third_party/cuml/LICENSE`, junto do
    subconjunto vendorizado (§4a da licença).
-2. ✅ `NOTICE` na raiz com a atribuição à NVIDIA, a versão fixada e a lista (por
-   enquanto vazia) de arquivos derivados modificados.
-3. ⬜ Preservar o cabeçalho SPDX e o *copyright* da NVIDIA em **todo** arquivo derivado,
-   acrescentando uma linha de modificação — p. ex.
-   `Modifications Copyright (c) 2026, Universidade Federal de Viçosa` (§4b) — e
-   registrar o arquivo na lista do `NOTICE`. A fazer junto com a primeira modificação.
-4. ⬜ Definir a licença do repositório. Recomendação: **Apache-2.0**, por compatibilidade
-   direta com o código derivado. É decisão dos autores.
-5. ⬜ No artigo, deixar explícito que a implementação **deriva** do cuML — isso é um ponto
-   forte metodológico (mesmas estruturas, comparação mais justa), não uma ressalva.
+2. ✅ `NOTICE` na raiz com atribuição à NVIDIA, versão fixada e lista dos arquivos
+   derivados identificados até esta revisão.
+3. ✅ `corepoints_multi.cuh`, `runner_multi.cuh` e `vertexdeg_cuvs.cuh` preservam SPDX e
+   copyright NVIDIA, acrescentam aviso de modificação UFV e aparecem no `NOTICE`.
+4. ⬜ Definir a licença **do repositório como um todo**. Não há `LICENSE` na raiz; a cópia
+   em `third_party/cuml/` cobre o vendorizado e não deve ser apresentada como decisão dos
+   autores para os demais arquivos.
+5. ⬜ Resolver a autorização de F2 antes de distribuir qualquer trecho que possa ter sido
+   copiado/adaptado. Compatibilidade de CLI e ideias devem ser distinguidas de código.
+6. ⬜ No artigo, deixar explícito que a implementação **deriva** do cuML e delimitar quais
+   afirmações têm artefato reprodutível. Estado detalhado em
+   [`licenciamento-e-proveniencia.md`](licenciamento-e-proveniencia.md).
 
 ---
 
@@ -235,7 +245,12 @@ repositório público deste trabalho, obter do autor (a) autorização explícit
 licença declarada no repositório de origem — de preferência Apache-2.0, para
 compatibilidade com F1.
 
-### 3.2 O que é reaproveitado
+### 3.2 Influências declaradas e fronteira de reuso
+
+As descrições abaixo registram a influência atribuída a F2; **não comprovam autorização
+para copiar código**. Enquanto não houver licença ou autorização escrita, nenhuma release
+deve alegar que incorporou o *harness* de F2. A auditoria precisa classificar cada trecho
+como interface compatível, ideia, implementação independente ou código adaptado.
 
 **(a) Contrato do executável CUDA** — é o que permite reusar o *harness* sem reescrevê-lo:
 
@@ -257,16 +272,18 @@ aceitar lista, e a saída vira `k·l × N`. **Decisão registrada:** ordem *eps-
 `config_id = e·l + m`, preservando a convenção já existente quando `l = 1`. O JSON deve
 reportar `configuration_count` (campo já lido por `compare_fast_dbscan.py`).
 
-**(b) Harness de benchmark e validação** (`benchmark.py`, `plots.py`,
-`profile_multi_eps.py`, `plot_multi_eps_profile.py`, `makefile`):
+**(b) Protocolo observado no harness de benchmark e validação** (`benchmark.py`,
+`plots.py`, `profile_multi_eps.py`, `plot_multi_eps_profile.py`, `makefile`). Ele serve como
+referência de requisitos; reutilização textual/estrutural continua bloqueada até a revisão
+de proveniência:
 
 - soma dos *fits* escalares do cuML vs. um único *fit* multiparamétrico — exatamente a
   comparação de "trabalho equivalente" descrita no artigo;
 - colunas `fit_speedup_vs_cuml` e `e2e_speedup_vs_cuml` (razão cuML/custom, `>1` = ganho),
   com as linhas do próprio cuML em `1.0`;
-- validação estrita por **ARI** *e* **concordância de ruído** (ARI sozinho esconde
-  divergências no rótulo `-1`); `ari_vs_cuml`/`noise_agreement` guardam o mínimo da
-  configuração, `ari_by_eps`/`noise_agreement_by_eps` guardam os valores individuais;
+- validação em F2 por **ARI** *e* **concordância de ruído** (ARI sozinho esconde
+  divergências no rótulo `-1`); esse protocolo é uma referência histórica de diagnóstico,
+  não o gate científico adotado aqui;
 - `min_ari: 0.999`, `min_noise_agreement: 0.999`, `warmup: 1`, `repeats: 5`, mediana nos
   gráficos; `make benchmark` falha em divergência, `make report` preserva no CSV;
 - suítes já parametrizadas: `study=size` (D=16, N=1000…10000), `study=dimension` (N=5000,
@@ -283,12 +300,13 @@ cuML. Serve como (i) referência de projeto para o kernel multi-ε, (ii) segunda
 implementação para checagem cruzada de resultados, e (iii) baliza de desempenho —
 se a versão derivada do cuML ficar bem abaixo dela, há regressão a investigar.
 
-### 3.3 Divergência a resolver
+### 3.3 Divergência de ambiente resolvida localmente
 
 O `makefile` de F2 assume `conda run -n dbscan_multi_env` e `LD_LIBRARY_PATH` de WSL
-(`/usr/lib/wsl/lib`). O ClusterGPU/UFV (F4) usa módulos EasyBuild + `venv`. Parametrizar
-o `makefile` (`RUN_PREFIX ?=`) em vez de fixar `conda`, e decidir como o cuML entra no
-ambiente do cluster (wheel `cuml-cu12` no `.venv`, alinhado ao padrão de F4, ou Conda).
+(`/usr/lib/wsl/lib`). Este projeto não adota esse ambiente: usa módulos EasyBuild, `venv`,
+wheels RAPIDS/cuML 26.02 e `scripts/setup_env.sh`. A primeira criação gera um lock; a
+reprodução usa `USE_LOCK=1`. Essa decisão de infraestrutura está resolvida, embora a
+proveniência de qualquer correspondência com F2 continue sob revisão.
 
 ---
 
@@ -316,15 +334,16 @@ N = 10⁶ contra 12 chamadas do cuML; média geral 10,9×; queda para 3,5× em D
 da grade completa em 1,2–2,3× o custo de avaliar 3 ε isolados.
 
 **Ponto em aberto herdado do artigo:** a equivalência de agrupamento (ARI/AMI) ficou fora
-do escopo daquela versão. Aqui **entra no escopo desde o início**, via o protocolo de
-validação de F2 (ARI + concordância de ruído contra o cuML, por configuração). Este é o
-principal ganho metodológico de derivar do cuML em vez de reimplementar.
+do escopo daquela versão. Aqui a correção entra no escopo por um oráculo CPU independente:
+ele valida pertencimento *core*, componentes conexos *core*, ruído e as escolhas permitidas
+para bordas ambíguas. ARI, concordância de ruído e partição canônica permanecem como
+diagnósticos, não como definição de correção.
 
 ---
 
 ## 5. F4 — Infraestrutura de execução (ClusterGPU/UFV)
 
-Fonte local: `C:\Users\AlphaXD\Desktop\UFV\IC\Estendido\ids_generalization_pipeline`.
+Fonte local: `<repositorio-local-de-referencia>/ids_generalization_pipeline`.
 Convenções extraídas de `scripts/run_debug_cluster_gpu.slm`, `scripts/run_ton_iot_gpu.slm`
 e `scripts/check_gpu_rapids.slm`, a serem seguidas pelos scripts deste projeto:
 
@@ -340,7 +359,7 @@ e `scripts/check_gpu_rapids.slm`, a serem seguidas pelos scripts deste projeto:
 #SBATCH --output=job_%j.out
 #SBATCH --error=job_%j.err
 #SBATCH --mail-type=ALL
-#SBATCH --mail-user=matheus.antony@ufv.br
+#SBATCH --mail-user=<seu-email@ufv.br>
 ```
 
 - `set -euo pipefail` e *echo* de `SLURM_JOB_ID`, `SLURM_NODELIST`,
@@ -386,14 +405,15 @@ principal. Confirmar a licença do repositório antes de vendorizar qualquer ada
 | Matriz de códigos (menor ε por par, 1 byte) + `codes_to_adj` por ε | Derivação de F3 (Alg. 2) para o *layout* de F1 | Contribuição |
 | *Bit packing* dos limites de *minPts* por ε (64 bits, 4 bits/ε) | F3 (§3.2.3) | **Não aplicável** nesta derivação — ver §2.3 |
 | Orçamento de memória e lote em função de *k* e *l* | F1 (`compute_batch_size`) | Modificação |
-| Contrato CLI (`--input/--output/--eps/--min-samples/--json`) | F2 | Reuso + extensão (lista de *minPts*) |
-| Ordem `config_id = e·l + m` (*eps-major*) | Decisão deste trabalho, estendendo F2 | Decisão |
-| Harness de benchmark, CSV, gráficos, suítes de estudo | F2 | Reuso |
-| Validação ARI + concordância de ruído por configuração | F2 | Reuso (escopo novo em relação a F3) |
-| Seleção automática de ε e *minPts* (Levina-Bickel + quantis k-dist) | F3 | Reuso |
-| Geradores sintéticos (5 famílias, D e N variáveis) | F3 | Reuso |
-| Scripts Slurm, módulos, layout `~/dados` | F4 | Reuso de convenção |
-| Comparação de três vias em 2D/3D | F5 via F2 | Opcional |
+| Contrato CLI (`--input/--output/--eps/--min-samples/--json`) | F2 | Compatibilidade de interface; correspondência de implementação sob revisão |
+| Ordem `config_id = e·l + m` (*eps-major*) | Decisão deste trabalho influenciada por F2 | Decisão |
+| Harness de benchmark e suítes de estudo | F2 | Requisito observado; qualquer correspondência de código/estrutura permanece bloqueada |
+| ARI + concordância de ruído por configuração | F2 | Diagnóstico observado; insuficiente como gate |
+| Oráculo semântico de *core*/componentes/ruído/borda | Decisão deste trabalho sobre a definição DBSCAN | Contribuição de validação independente |
+| Seleção automática de ε e *minPts* (Levina-Bickel + quantis k-dist) | F3 | Adaptação interna; autorização a confirmar |
+| Geradores sintéticos (5 famílias, D e N variáveis) | F3 | Adaptação interna; autoria/autorização a confirmar |
+| Scripts Slurm, módulos, layout `~/dados` | F4 | Convenção influenciada por F4; possível cópia textual a revisar |
+| Comparação de três vias em 2D/3D | F5 via F2 | Opcional; nenhum código F5 incluído nesta revisão |
 
 ---
 
@@ -404,11 +424,25 @@ Sem estes campos, os resultados não são comparáveis entre execuções nem cit
 - modelo de GPU, versão do driver, versão do CUDA *toolkit*, *compute capability*;
 - tag/SHA do cuML usada no código derivado **e** versão do pacote `cuml` do baseline;
 - versões de RAFT/RMM/cuVS, se aplicável ao build escolhido;
+- SHA-256 do binário e identidade embutida (`build_id`, `git_sha`, `git_dirty`, backends
+  compilados), conferida contra o commit do manifesto;
 - precisão (float32), métrica (L2), `algorithm`/`EpsNnMethod` do baseline;
+- índice solicitado e índice efetivamente executado;
+- pedido e orçamento efetivo de lote do binário, pedido enviado ao cuML e a limitação de
+  que o orçamento efetivo interno da API Python não é observável (`batch_budget_protocol`);
 - `n`, `d`, família do dataset, semente, lista de ε, lista de *minPts*, `k`, `l`;
+- SHA-256 de pontos, rótulos, metadados e gerador; para `N > 60.000`, população, tamanho
+  da amostra e posto kNN corrigido que originaram a grade;
 - `warmup`, `repeats`, e a fronteira de medição (`fit_ms` vs `e2e_ms`);
-- ARI e concordância de ruído por configuração;
+- resultado da matriz cuVS/codes/cuML, número de sementes, cobertura do oráculo semântico
+  e checks de *core*, componentes, ruído e borda; ARI/partição apenas como diagnósticos;
 - SHA do commit deste repositório.
+
+O contrato legível por máquina está em
+`schemas/experiment-manifest.schema.json`. Manifests revisados ficam em
+`results/manifests/`; o JSON emitido diretamente pelo benchmark não substitui o manifesto,
+porque hoje ele não contém todos os campos acima. O procedimento e os gates estão em
+[`reprodutibilidade.md`](reprodutibilidade.md).
 
 ---
 
@@ -416,18 +450,21 @@ Sem estes campos, os resultados não são comparáveis entre execuções nem cit
 
 | # | Item | Tipo | Ação |
 |---|------|------|------|
-| 1 | F2 sem licença declarada | **Bloqueante para publicação** | Obter autorização escrita + licença no repositório de origem |
-| 2 | Build A (vendor + `nvcc`) vs. B (`libcuml++` completo) | Decisão de arquitetura | **Resolvido: A.** Compila e linka no ClusterGPU/UFV contra os wheels `libraft`/`librmm`/`rapids_logger`/`libcuvs` |
+| 1 | F2 sem licença declarada | **Bloqueante para publicação** | Obter autorização escrita/licença ou demonstrar implementação independente e remover qualquer trecho não autorizado |
+| 2 | Build A (vendor + `nvcc`) vs. B (`libcuml++` completo) | Decisão de arquitetura | **Resolvido: A.** Compila e linka contra `libraft`/`librmm`/`libcuvs`/`librapids_logger`; o shim substitui apenas o logger gerado do cuML |
 | 2b | Substituir a busca de vizinhança do cuVS por kernel próprio | **Decisão revista** | **Revertida.** Era a peça mais ajustada do pipeline; o multi-ε passou a entrar sobre o CSR do cuML (§2.3). O kernel próprio virou `--backend codes`, para validação cruzada |
-| 3 | Cabeçalhos de modificação + lista no `NOTICE` | Conformidade Apache-2.0 | **Feito** para `corepoints_multi.cuh` e `runner_multi.cuh`; repetir a cada novo arquivo derivado |
+| 3 | Cabeçalhos de modificação + lista no `NOTICE` | Conformidade Apache-2.0 | **Feito** para `corepoints_multi.cuh`, `runner_multi.cuh` e `vertexdeg_cuvs.cuh`; repetir a cada novo derivado |
 | 3b | *Shim* do logger (o `logger_macros.hpp` do cuML é gerado pelo CMake e não existe no repo) | Build | **Resolvido:** `src/compat/cuml/common/logger.hpp` substitui `<cuml/common/logger.hpp>` por prioridade de `-I` |
-| 3d | Nada foi compilado ainda — não há CUDA toolkit na máquina de desenvolvimento | **Verificação** | Primeira compilação e `--selftest` via `sbatch scripts/check_gpu.slm` |
+| 3d | Gate semântico implementado, mas sem campanha versionada | **Verificação** | Rodar 10 sementes no desenvolvimento e 100 na campanha; promover matriz, manifesto, lock, binário e hashes |
 | 3c | Licença do próprio repositório | Decisão dos autores | Recomendado Apache-2.0 |
-| 4 | `compute_batch_size` não considera *k* e *l* | Risco de OOM em N = 10⁶ | Modificar antes da suíte de escala |
-| 5 | Conda (F2) vs. venv + módulos (F4) | Ambiente | Parametrizar `makefile`; decidir wheel `cuml-cu12` ou Conda |
+| 4 | `compute_batch_size` considerar *k* e *l* | Risco de OOM em N = 10⁶ | **Implementado** em `compute_batch_size_multi`; manter os testes de lote e correção de `neigh_per_row` |
+| 5 | Ambiente venv + módulos e RAPIDS 26.02 | Reprodutibilidade | **Decidido**, mas falta versionar o lock produzido no cluster e registrar todas as versões no manifesto |
 | 6 | GPU do cluster ≠ A100-80GB do artigo | Comparabilidade | Registrar hardware; não comparar números absolutos com F3 |
 | 7 | Adaptadores de F5 fixos em 2D/3D | Escopo | Restringir a comparação de três vias a 2D/3D |
-| 8 | Limite de 16 ε / 15 *minPts* do *bit packing* | Limitação conhecida | Documentar; validar a grade 3×4 dentro do limite |
+| 8 | Limite efetivo de parâmetros | Limitação conhecida | Há limite de 16 ε; não há limite algorítmico de 15 *minPts* nesta derivação, apenas memória para máscaras/rótulos |
+| 9 | Duas rotas cuVS adaptativas por lote | Interpretação de desempenho | Registrar rota/perfil no artefato e não alegar que toda grade compartilha uma única busca |
+| 10 | Licença raiz ausente | **Bloqueante para release pública** | Autores devem escolher a licença; `NOTICE` e a licença do vendorizado não substituem essa decisão |
+| 11 | Grades antigas sem correção do posto kNN para N > 60k | **Quebra de protocolo** | Tratar jobs 4911–4917 como históricos; regenerar dados/grades e novos hashes antes da campanha |
 
 ---
 

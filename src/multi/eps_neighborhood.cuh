@@ -276,6 +276,77 @@ __global__ void epsNeighborhoodGenericKernel(const value_t* __restrict__ x,
 }
 
 /**
+ * Fallback para D tão alto que nem uma coluna cabe no orçamento de shared memory.
+ *
+ * O caminho tiled não pode lançar `D*sizeof(value_t)` bytes quando isso ultrapassa o
+ * limite do bloco. Este kernel relê os dois pontos da memória global, preserva o mesmo
+ * corte antecipado e troca apenas desempenho por correção/portabilidade.
+ */
+template <typename value_t, typename index_t, int TPB, int MAX_K>
+__global__ void epsNeighborhoodGlobalKernel(const value_t* __restrict__ x,
+                                             index_t N,
+                                             index_t D,
+                                             index_t start_row,
+                                             index_t n_points,
+                                             const value_t* __restrict__ eps2,
+                                             int k,
+                                             std::uint8_t* __restrict__ codes,
+                                             index_t* __restrict__ vd,
+                                             index_t vd_stride)
+{
+  const index_t row = static_cast<index_t>(blockIdx.x) * TPB +
+                      static_cast<index_t>(threadIdx.x);
+  const bool active = row < n_points;
+
+  value_t e2[MAX_K];
+#pragma unroll
+  for (int c = 0; c < MAX_K; ++c) {
+    e2[c] = (c < k) ? eps2[c] : value_t(0);
+  }
+  const value_t cutoff = eps2[k - 1];
+
+  index_t cnt[MAX_K];
+#pragma unroll
+  for (int c = 0; c < MAX_K; ++c) {
+    cnt[c] = 0;
+  }
+
+  if (active) {
+    const value_t* q = x + static_cast<std::size_t>(start_row + row) * D;
+    std::uint8_t* codes_row = codes + static_cast<std::size_t>(row) * N;
+    for (index_t j = 0; j < N; ++j) {
+      const value_t* p = x + static_cast<std::size_t>(j) * D;
+      value_t acc      = value_t(0);
+      for (index_t dim = 0; dim < D; ++dim) {
+        const value_t diff = q[dim] - p[dim];
+        acc += diff * diff;
+        if (acc > cutoff) break;
+      }
+
+      std::uint8_t code = kNoNeighbor;
+      if (acc <= cutoff) {
+#pragma unroll
+        for (int c = MAX_K - 1; c >= 0; --c) {
+          if (c < k && acc <= e2[c]) code = static_cast<std::uint8_t>(c);
+        }
+      }
+      codes_row[j] = code;
+#pragma unroll
+      for (int c = 0; c < MAX_K; ++c) {
+        cnt[c] += (c < k && code <= static_cast<std::uint8_t>(c)) ? index_t(1) : index_t(0);
+      }
+    }
+
+#pragma unroll
+    for (int c = 0; c < MAX_K; ++c) {
+      if (c < k) vd[c * vd_stride + row] = cnt[c];
+    }
+  }
+
+  reduceAndAccumulate<index_t, TPB, MAX_K>(cnt, active, k, vd, vd_stride, n_points);
+}
+
+/**
  * Materializa a matriz booleana de adjacência de um ε a partir dos códigos.
  *
  * É o que permite reaproveitar AdjGraph::run (adj_to_csr) do cuML sem alteração: uma
@@ -337,6 +408,10 @@ void launch_by_dim(const value_t* x,
     DBSCANMULTI_LAUNCH_REG(16);
   } else if (D <= 32) {
     DBSCANMULTI_LAUNCH_REG(32);
+  } else if (static_cast<std::size_t>(D) * sizeof(value_t) > kTileSharedBytes) {
+    epsNeighborhoodGlobalKernel<value_t, index_t, TPB, MAX_K>
+      <<<blocks, TPB, 0, stream>>>(
+        x, N, D, start_row, n_points, eps2, k, codes, vd, vd_stride);
   } else {
     epsNeighborhoodGenericKernel<value_t, index_t, TPB, MAX_K>
       <<<blocks, TPB, shmem, stream>>>(

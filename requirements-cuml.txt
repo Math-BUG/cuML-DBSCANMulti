@@ -5,27 +5,29 @@
 #
 #   INSTALL_CUML=1 bash scripts/setup_env.sh
 #
-# Sem versão fixada de propósito: o pip resolve o que for compatível com o Python do nó.
-# No ClusterGPU/UFV (Python 3.10.12) isso cai em 26.02, que é a última série com wheels
-# cp310 — e é a mesma série da tag do cuML vendorizada em third_party/cuml. Se um dia o
-# Python do cluster mudar, confira a versão resolvida em requirements.lock.txt e alinhe a
-# tag vendorizada; ver docs/fontes-primarias.md.
+# Todos os componentes RAPIDS diretos ficam na MESMA série 26.02 da tag vendorizada.
+# O curinga fixa a série e admite apenas correções 26.2.x; dependências transitivas não são
+# inventadas aqui. A execução citável deve versionar o requirements.lock.txt produzido
+# pelo pip no próprio cluster. RAPIDS 26.02 suporta Python 3.10 e CUDA 12.2--12.9:
+# https://docs.rapids.ai/platform-support/#rapids-26-02
 --extra-index-url https://pypi.nvidia.com
 
-cupy-cuda12x
-cuml-cu12
+# Versão observada nos logs A100 que originaram os números preliminares do README.
+cupy-cuda12x==14.1.1
+cuml-cu12==26.2.*
 
 # Trazem os cabeçalhos C++ em site-packages/{libraft,librmm}/include, usados para
 # compilar o binário CUDA. Vêm como dependência do cuml-cu12, listados aqui só para
 # deixar explícito de onde saem.
-libraft-cu12
-librmm-cu12
+libraft-cu12==26.2.*
+librmm-cu12==26.2.*
 
 # cuVS: é ele que faz a busca de vizinhança do DBSCAN do cuML, e o backend padrão do nosso
 # binário usa a mesma chamada. Ao contrário de libraft/librmm, NÃO veio junto do cuml-cu12
 # na instalação do ClusterGPU/UFV — por isso está listado explicitamente.
-libcuvs-cu12
+libcuvs-cu12==26.2.*
 
-# raft/core/logger.hpp inclui rapids_logger/log_levels.h, que mora neste pacote (PyPI
-# público, sem sufixo de CUDA). Traz também librapids_logger.so, usada no link.
+# Dependência transitiva dos headers do RAFT: raft/core/logger.hpp inclui
+# rapids_logger/log_levels.h. A versão independente é congelada no requirements.lock.txt
+# gerado no próprio cluster.
 rapids-logger

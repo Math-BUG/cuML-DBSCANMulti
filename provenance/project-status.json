@@ -1,0 +1,58 @@
+{
+  "$schema": "../schemas/provenance-status.schema.json",
+  "schema_version": "1.0.0",
+  "reviewed_at": "2026-08-10",
+  "publication_ready": false,
+  "project_license": {
+    "status": "unresolved",
+    "root_license_file": null,
+    "note": "Os autores ainda não escolheram uma licença para o repositório como um todo."
+  },
+  "sources": [
+    {
+      "id": "F1",
+      "name": "RAPIDS cuML v26.02.00",
+      "status": "resolved",
+      "license": "Apache-2.0",
+      "evidence": "third_party/cuml/LICENSE e third_party/cuml/VENDORED.md",
+      "note": "Subconjunto vendorizado e arquivos derivados identificados no NOTICE."
+    },
+    {
+      "id": "F2",
+      "name": "Morphy999/DBSCANMultiE",
+      "status": "unresolved",
+      "license": null,
+      "evidence": "docs/fontes-primarias.md seção 3",
+      "note": "Fonte privada sem licença declarada; requer autorização ou revisão de implementação independente."
+    },
+    {
+      "id": "F3",
+      "name": "SSCAD 2026 e Math-BUG/INF-494",
+      "status": "review-required",
+      "license": null,
+      "evidence": "README.md seção Datasets e docs/fontes-primarias.md seção 4",
+      "note": "Confirmar autoria e autorização dos geradores adaptados antes da release."
+    },
+    {
+      "id": "F4",
+      "name": "Convenções ClusterGPU/UFV",
+      "status": "review-required",
+      "license": null,
+      "evidence": "docs/fontes-primarias.md seção 5",
+      "note": "Confirmar se os scripts contêm apenas convenções ou trechos copiados."
+    },
+    {
+      "id": "F5",
+      "name": "CUDA-DClust+",
+      "status": "not-included",
+      "license": null,
+      "evidence": "docs/fontes-primarias.md seção 6",
+      "note": "Nenhum código F5 é distribuído nesta revisão."
+    }
+  ],
+  "blockers": [
+    "Escolha e aprovação da licença raiz pelos autores.",
+    "Autorização/licença de F2 ou conclusão documentada de implementação independente.",
+    "Revisão interna de autoria e autorização para F3/F4."
+  ]
+}

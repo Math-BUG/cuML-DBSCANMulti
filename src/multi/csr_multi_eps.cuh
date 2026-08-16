@@ -46,6 +46,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <type_traits>
 
 namespace ML {
 namespace Dbscan {
@@ -61,15 +62,35 @@ static constexpr std::size_t kMaxQuerySharedBytes = 32 * 1024;
 /**
  * Anota o CSR do maior ε e produz os graus de todos os raios.
  *
- * Um bloco por linha do lote. Cada thread percorre uma fatia das entradas da linha,
- * calcula a distância ao quadrado do par e determina o menor ε que o contém. O histograma
- * dos códigos fica em shared; seu prefixo é exatamente o grau da linha em cada raio.
+ * Um bloco por linha do lote e um GRUPO de `G` lanes por entrada do CSR. O grupo lê a linha
+ * `x[col]` de forma coalescida — lane t lê o componente t, t+G, ... — e reduz a distância
+ * por `__shfl_down_sync`.
+ *
+ * Por que não uma thread por entrada, que era a versão anterior: naquela, as 32 lanes de um
+ * warp liam 32 COLUNAS diferentes no mesmo componente. Os endereços ficavam espalhados e
+ * cada lane puxava um setor de 32 bytes para aproveitar 4. Medido no job 4895: 300 GB de
+ * tráfego a 218 GB/s numa A100 de 2039 GB/s, 11% do pico, e a anotação custando 11x mais
+ * que a busca do cuVS que calcula as MESMAS distâncias — só que em tiles.
+ *
+ * `G` é escolhido no host a partir de D (ver `annotate`). Abaixo de 8 dimensões uma linha de
+ * x nem chega a encher um setor, então coalescer não tem o que ganhar e `G = 1` reproduz o
+ * caminho antigo, que ao menos mantém as 128 threads ocupadas.
+ *
+ * O laço tem contagem UNIFORME no bloco de propósito: grupos com `p >= len` continuam
+ * entrando nas reduções com contribuição zero. Sair mais cedo divergiria dentro do warp e
+ * `__shfl_down_sync` com máscara cheia passaria a ser comportamento indefinido.
+ *
+ * Nota numérica: a soma dos quadrados passa a ser em árvore, não sequencial em t. O erro de
+ * arredondamento cresce com O(log D) em vez de O(D) — é mais preciso —, mas é um valor
+ * DIFERENTE do anterior nos últimos bits. Pares exatamente na fronteira de um ε podem mudar
+ * de faixa. Por isso esta mudança tem de passar pela matriz de validação, não só pelo
+ * selftest.
  *
  * @param[in]  row_len   graus no maior ε (o `vd` que o cuVS produziu)
  * @param[out] codes     um byte por entrada do CSR
  * @param[out] vd_multi  k x vd_stride; a posição n_points de cada fatia recebe a soma
  */
-template <typename value_t, typename index_t, int TPB>
+template <typename value_t, typename index_t, int TPB, int G>
 __global__ void annotateKernel(const value_t* __restrict__ x,
                                index_t D,
                                index_t start_row,
@@ -84,6 +105,9 @@ __global__ void annotateKernel(const value_t* __restrict__ x,
                                index_t vd_stride,
                                bool query_in_shared)
 {
+  static_assert(G >= 1 && G <= 32 && (G & (G - 1)) == 0, "G deve ser potência de 2 até 32");
+  static_assert(TPB % G == 0, "TPB deve ser múltiplo de G");
+
   const index_t row = static_cast<index_t>(blockIdx.x);
   if (row >= n_points) return;
 
@@ -109,26 +133,44 @@ __global__ void annotateKernel(const value_t* __restrict__ x,
   const index_t begin = ex_scan[row];
   const index_t len   = row_len[row];
 
-  for (index_t p = threadIdx.x; p < len; p += TPB) {
-    const index_t col = adj_graph[begin + p];
-    const value_t* xc = x + static_cast<std::size_t>(col) * D;
+  constexpr int kGrupos = TPB / G;
+  const int grupo       = static_cast<int>(threadIdx.x) / G;
+  const int lane        = static_cast<int>(threadIdx.x) % G;
+
+  const index_t iteracoes = (len + kGrupos - 1) / kGrupos;
+
+  for (index_t it = 0; it < iteracoes; ++it) {
+    const index_t p    = it * kGrupos + grupo;
+    const bool ativo   = p < len;
+    const index_t col  = ativo ? adj_graph[begin + p] : static_cast<index_t>(0);
+    const value_t* xc  = x + static_cast<std::size_t>(col) * D;
 
     value_t dist = 0;
-    for (index_t t = 0; t < D; ++t) {
-      const value_t diff = q[t] - xc[t];
-      dist += diff * diff;
+    if (ativo) {
+      for (index_t t = lane; t < D; t += G) {
+        const value_t diff = q[t] - xc[t];
+        dist += diff * diff;
+      }
     }
 
-    // A entrada veio do maior raio, então k-1 sempre satisfaz. Varrendo em ordem
-    // decrescente, o último raio que satisfaz é o menor — a monotonicidade garante que
-    // não há buracos.
-    int code = k - 1;
-    for (int e = k - 2; e >= 0; --e) {
-      if (dist <= s_eps2[e]) code = e;
+    // Máscara cheia: todas as lanes do warp chegam aqui, por construção do laço. O `width`
+    // segmenta o warp em grupos de G, que é o alcance da redução.
+    for (int off = G / 2; off > 0; off >>= 1) {
+      dist += __shfl_down_sync(0xffffffffu, dist, off, G);
     }
 
-    codes[begin + p] = static_cast<std::uint8_t>(code);
-    atomicAddIndex<index_t>(&hist[code], static_cast<index_t>(1));
+    if (ativo && lane == 0) {
+      // A entrada veio do maior raio, então k-1 sempre satisfaz. Com eps2 crescente, o
+      // primeiro raio que NÃO contém o par encerra a busca: nenhum menor conteria.
+      int code = k - 1;
+      for (int e = k - 2; e >= 0; --e) {
+        if (dist > s_eps2[e]) break;
+        code = e;
+      }
+
+      codes[begin + p] = static_cast<std::uint8_t>(code);
+      atomicAddIndex<index_t>(&hist[code], static_cast<index_t>(1));
+    }
   }
   __syncthreads();
 
@@ -223,20 +265,36 @@ void annotate(const value_t* x,
       vd_multi + static_cast<std::size_t>(e) * vd_stride + n_points, 0, sizeof(index_t), stream));
   }
 
-  annotateKernel<value_t, index_t, TPB>
-    <<<static_cast<int>(n_points), TPB, shmem, stream>>>(x,
-                                                         D,
-                                                         start_row,
-                                                         n_points,
-                                                         ex_scan,
-                                                         row_len,
-                                                         adj_graph,
-                                                         eps2,
-                                                         k,
-                                                         codes,
-                                                         vd_multi,
-                                                         vd_stride,
-                                                         query_in_shared);
+  // Lanes por entrada. Um setor de memória são 32 bytes, ou 8 floats: abaixo disso a linha
+  // de x não enche um setor e coalescer não tem o que ganhar, então G = 1 mantém o caminho
+  // antigo, com as 128 threads em entradas distintas.
+  auto lancar = [&](auto grupo_const) {
+    constexpr int G = decltype(grupo_const)::value;
+    annotateKernel<value_t, index_t, TPB, G>
+      <<<static_cast<int>(n_points), TPB, shmem, stream>>>(x,
+                                                           D,
+                                                           start_row,
+                                                           n_points,
+                                                           ex_scan,
+                                                           row_len,
+                                                           adj_graph,
+                                                           eps2,
+                                                           k,
+                                                           codes,
+                                                           vd_multi,
+                                                           vd_stride,
+                                                           query_in_shared);
+  };
+
+  if (D >= 32) {
+    lancar(std::integral_constant<int, 32>{});
+  } else if (D >= 16) {
+    lancar(std::integral_constant<int, 16>{});
+  } else if (D >= 8) {
+    lancar(std::integral_constant<int, 8>{});
+  } else {
+    lancar(std::integral_constant<int, 1>{});
+  }
   RAFT_CUDA_TRY(cudaPeekAtLastError());
 }
 

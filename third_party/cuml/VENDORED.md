@@ -22,13 +22,15 @@ qual as variantes Multi-EPS, Multi-minPts e Multi-Both são derivadas.
 ## Arquivos e verificação
 
 Cada arquivo foi conferido contra o *blob SHA* do próprio git do upstream. Para
-reverificar a qualquer momento:
+reverificar a qualquer momento, prefira o manifesto legível por máquina `VENDORED.json`
+e `python scripts/check_repo_metadata.py`. A receita manual equivalente é:
 
 ```bash
 gh api "repos/rapidsai/cuml/git/trees/v26.02.00?recursive=1" \
   --jq '.tree[] | select(.type=="blob") | .path + " " + .sha' > /tmp/blobs.txt
 cd third_party/cuml
-find . -type f -not -name VENDORED.md | sed 's|^\./||' | sort | while read f; do
+find . -type f -not -name VENDORED.md -not -name VENDORED.json | \
+  sed 's|^\./||' | sort | while read f; do
   up=$(grep -E "^$f " /tmp/blobs.txt | awk '{print $2}')
   [ "$up" = "$(git hash-object "$f")" ] && echo "OK   $f" || echo "DIFF $f"
 done
@@ -59,7 +61,8 @@ done
 | `4cbe8c982b24` | `cpp/tests/sg/dbscan_test.cu` | Referência para os testes de equivalência |
 | `cf63ae845bab` | `cpp/bench/sg/dbscan.cu` | Referência de medição |
 
-Todos os 22 arquivos conferiram **OK** na cópia de 2026-08-04.
+Todos os 22 arquivos upstream conferiram **OK** na cópia de 2026-08-04. `VENDORED.md` e
+`VENDORED.json` são metadados locais e não entram nessa contagem.
 
 ## Dependências externas destes arquivos
 
@@ -67,18 +70,24 @@ Levantadas a partir dos `#include` da árvore vendorizada:
 
 | Dependência | Natureza | Situação |
 |-------------|----------|----------|
-| RAFT (`raft/core`, `raft/sparse`, `raft/linalg`, `raft/label`, `raft/util`) | *header-only* (alvo `raft::raft` é INTERFACE) | Necessária; sem build |
-| RMM (`rmm/device_uvector.hpp`) | *header-only* | Necessária; sem build |
-| Thrust / CUB / CCCL | Vem com o CUDA Toolkit | Necessária |
+| RAFT (`raft/core`, `raft/sparse`, `raft/linalg`, `raft/label`, `raft/util`) | Cabeçalhos; o projeto pode ligar `libraft` conforme o ambiente | Necessária |
+| RMM (`rmm/device_uvector.hpp`) | Cabeçalhos + símbolos em `librmm.so` no build derivado | Necessária |
+| Thrust / CUB / CCCL | CUDA Toolkit ou cópia compatível no wheel RMM | Necessária |
 | **cuVS** (`cuvs/neighbors/epsilon_neighborhood.hpp`, `cuvs/neighbors/ball_cover.hpp`) | Biblioteca **compilada** | Usada em **apenas 2 arquivos**: `runner.cuh` e `vertexdeg/algo.cuh` |
-| `rapids_logger/logger.hpp` | Biblioteca externa | Substituível por *shim* |
+| `rapids_logger/logger.hpp` | Headers + `librapids_logger.so` | Necessária transitivamente por `raft/core/logger.hpp`; o shim substitui apenas o logger do cuML |
 
-**Consequência prática — o cuVS some do build.** A única dependência compilada pesada
-está confinada aos dois arquivos que já precisam ser modificados de qualquer forma:
-`vertexdeg/algo.cuh` (a chamada a `epsilon_neighborhood::compute` só aceita ε escalar e
-será trocada pelo kernel multi-ε) e `runner.cuh` (índice RBC, fora de escopo). Removendo
-o caminho RBC e substituindo a busca de vizinhança, restam apenas cabeçalhos — o binário
-pode ser compilado direto com `nvcc`, sem construir `libcuml++` nem `libcuvs`.
+**Consequência no projeto derivado atual.** A árvore acima permanece apenas como fonte
+verbatim; o build usa os arquivos modificados em `src/multi/`. O backend padrão preserva a
+chamada `epsilon_neighborhood::compute` e, portanto, compila e liga `libcuvs`. O backend
+`codes` substitui a busca e não precisa de `libcuvs`. O shim em
+`src/compat/cuml/common/logger.hpp` elimina o logger próprio do cuML, mas os headers do
+RAFT ainda exigem `rapids_logger/log_levels.h`; por isso `rapids-logger` permanece. Em
+nenhum dos casos é necessário construir o `libcuml++` completo.
+
+No backend cuVS, a execução começa no maior ε e escolhe por lote entre anotar/compactar o
+CSR (grafo esparso) e reutilizar esse primeiro resultado enquanto calcula os demais raios,
+totalizando uma chamada cuVS por ε (grafo denso). Essa política pertence ao código derivado
+e não altera os blobs registrados neste manifesto.
 
 ## Cabeçalho gerado em tempo de build
 
@@ -86,8 +95,12 @@ pode ser compilado direto com `nvcc`, sem construir `libcuml++` nem `libcuvs`.
 existe no repositório**: é gerado pelo CMake do cuML via
 `create_logger_macros(CUML "ML::default_logger()" include/cuml/common)`
 (`cpp/CMakeLists.txt:259`). Em um build fora do CMake do cuML é preciso fornecer um
-*shim* com as macros `CUML_LOG_DEBUG` / `CUML_LOG_INFO` / `CUML_LOG_WARN` (podem ser
-no-ops), ou substituir o `logger.hpp` inteiro. O *shim* vai fora desta pasta.
+*shim* com as macros `CUML_LOG_DEBUG` / `CUML_LOG_INFO` / `CUML_LOG_WARN`. O projeto
+fornece esse shim em `src/compat/cuml/common/logger.hpp`, fora desta pasta, como exige a
+regra de árvore verbatim. Isso não elimina a dependência transitiva introduzida pelo RAFT.
+As dependências
+efetivamente linkadas continuam sendo definidas pelo `Makefile`; este manifesto não deve
+ser usado como lista de link.
 
 ## Como atualizar a versão fixada
 
@@ -98,5 +111,5 @@ Trocar a tag invalida a comparação com o *baseline*: o código derivado e o pa
    ambiente Python do baseline);
 2. recopiar os arquivos e reverificar os *blob SHAs*;
 3. refazer o `diff` das modificações — o upstream pode ter mexido no `runner.cuh`;
-4. reexecutar a suíte de validação (ARI + concordância de ruído) antes de qualquer
-   medição de tempo.
+4. reexecutar o oráculo semântico de DBSCAN e a suíte de validação completa antes de
+   qualquer medição de tempo.

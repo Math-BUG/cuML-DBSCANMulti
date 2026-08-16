@@ -1,0 +1,3 @@
+# Dependência direta do validador de schemas. Transitivas são resolvidas pelo pip do CI;
+# não fazem parte do ambiente científico e não são inventadas neste arquivo.
+jsonschema==4.23.0

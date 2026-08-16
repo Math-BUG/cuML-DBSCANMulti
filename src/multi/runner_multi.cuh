@@ -68,6 +68,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <type_traits>
 #include <vector>
 
 namespace ML {
@@ -139,14 +140,18 @@ std::size_t est_mem_per_row_multi(Index_ N,
          (neigh_per_row + 2) * sizeof(Index_) + static_cast<std::size_t>(n_eps) * sizeof(Index_);
 }
 
-/** Memória independente do lote: as k*l máscaras de pontos centrais e os k*l rótulos. */
+/**
+ * Memória do workspace independente do lote: as k*l máscaras de pontos centrais e os
+ * dois vetores temporários de rótulos usados pela fusão. O vetor de saída k*l*N é
+ * alocado pelo chamador antes de `fit_multi` e, portanto, já foi descontado do valor
+ * devolvido por `cudaMemGetInfo`; contá-lo aqui de novo reduziria artificialmente o lote.
+ */
 template <typename Index_ = int>
 std::size_t est_mem_fixed_multi(Index_ N, int n_eps, int n_min_pts)
 {
   const std::size_t n_configs = static_cast<std::size_t>(n_eps) * n_min_pts;
   return static_cast<std::size_t>(N) * sizeof(bool) * n_configs +
-         static_cast<std::size_t>(N) * sizeof(Index_) * 2 +
-         static_cast<std::size_t>(N) * sizeof(Index_) * n_configs;
+         static_cast<std::size_t>(N) * sizeof(Index_) * 2;
 }
 
 /**
@@ -175,7 +180,7 @@ std::size_t est_mem_fixed_multi(Index_ N, int n_eps, int n_min_pts)
  */
 inline std::size_t& csr_teto_de_teste()
 {
-  static std::size_t teto = 0;
+  static thread_local std::size_t teto = 0;
   return teto;
 }
 
@@ -186,8 +191,27 @@ inline std::size_t& csr_teto_de_teste()
  */
 inline int& csr_correcoes_de_lote()
 {
-  static int n = 0;
+  static thread_local int n = 0;
   return n;
+}
+
+/** Metadados da última chamada, usados para tornar cada JSON experimental auditável. */
+struct ExecutionStats {
+  std::size_t max_bytes_per_batch = 0;
+  std::size_t batch_size          = 0;
+  int batches                     = 0;
+  int attempts                    = 0;
+  int batch_corrections           = 0;
+  int dense_batches               = 0;
+  int annotated_batches           = 0;
+  long long max_nnz               = 0;
+  long long total_nnz_max_eps     = 0;
+};
+
+inline ExecutionStats& last_execution_stats()
+{
+  static thread_local ExecutionStats stats;
+  return stats;
 }
 
 /**
@@ -387,8 +411,13 @@ constexpr long long kCustoFixoPorBusca = 60000000000LL;
  */
 inline bool anotar_compensa(long long nnz, long long pares, int n_eps, long long D)
 {
-  const long long custo_anotar  = nnz * D * kVantagemDoTiling;
-  const long long custo_buscas  = (n_eps - 1) * (pares * D + kCustoFixoPorBusca);
+  // A decisão só precisa da ordem entre os custos. Promover antes de multiplicar evita
+  // overflow assinado (comportamento indefinido) em N/D grandes sem saturar a heurística.
+  const long double custo_anotar =
+    static_cast<long double>(nnz) * D * kVantagemDoTiling;
+  const long double custo_buscas = static_cast<long double>(n_eps - 1) *
+                                   (static_cast<long double>(pares) * D +
+                                    static_cast<long double>(kCustoFixoPorBusca));
   return custo_anotar < custo_buscas;
 }
 
@@ -403,7 +432,7 @@ inline bool anotar_compensa(long long nnz, long long pares, int n_eps, long long
  */
 inline int& rota_forcada()
 {
-  static int rota = 0;
+  static thread_local int rota = 0;
   return rota;
 }
 
@@ -429,8 +458,9 @@ std::size_t max_bytes_for_batch_size(Index_ N,
  *
  * Diferenças: a memória por linha inclui a matriz de códigos de ε (1 byte por par, além
  * da booleana de adjacência) e os k graus por ponto; a memória fixa inclui as k*l máscaras
- * de pontos centrais e os k*l vetores de rótulos. Sem isso, o lote calculado para o caso
- * escalar estoura a memória assim que a grade cresce.
+ * de pontos centrais e os dois vetores temporários de rótulos. Os k*l rótulos de saída
+ * já estão residentes fora do workspace. Sem essa separação, o modo automático desconta
+ * a saída duas vezes da memória livre e escolhe lotes desnecessariamente pequenos.
  */
 template <typename Index_ = int>
 std::size_t compute_batch_size_multi(std::size_t& estimated_memory,
@@ -461,14 +491,46 @@ std::size_t compute_batch_size_multi(std::size_t& estimated_memory,
 
   // Mesma restrição de overflow do cuML: o CSR do lote indexa N * batch_size elementos.
   const Index_ MAX_LABEL = std::numeric_limits<Index_>::max();
-  if (batch_size > static_cast<std::size_t>(MAX_LABEL / N)) {
-    batch_size = static_cast<std::size_t>(MAX_LABEL / N);
+  const std::size_t max_batch_by_index =
+    static_cast<std::size_t>((MAX_LABEL - static_cast<Index_>(1)) / N);
+  ASSERT(max_batch_by_index >= 1,
+         "N=%d não permite nem um lote de uma linha com o tipo de índice escolhido",
+         (int)N);
+  if (batch_size > max_batch_by_index) {
+    batch_size = max_batch_by_index;
     CUML_LOG_INFO("Batch size limited by the index type to %zu", batch_size);
   }
 
   estimated_memory = batch_size * est_mem_per_row + est_mem_fixed;
   return batch_size;
 }
+
+/**
+ * Buffers dimensionados por nnz — o tamanho só se conhece depois da busca, então eles não
+ * cabem no workspace, que é dimensionado antes.
+ *
+ * Existem por fora de `run_multi_grid_*` para poderem sobreviver entre chamadas. Sendo
+ * locais da função, eram alocados e liberados a cada `fit_multi`: em heterogeneous_blobs_64d
+ * são 9,4 GB de adj_graph, 9,4 GB de adj_graph_f e 1,2 GB de codes — 20 GB de cudaMalloc e
+ * cudaFree por chamada, dentro da região cronometrada. É o mesmo defeito que o workspace
+ * tinha, um nível abaixo, e maior: o workspace ali são 3,8 GB.
+ *
+ * O RMM deste build usa `cuda_memory_resource`, não pool, então cada alocação é um
+ * cudaMalloc cru que sincroniza o dispositivo.
+ *
+ * Quem chama `fit_multi` em laço — warmup, repeat, uma grade por vez — deve passar um destes.
+ */
+template <typename Index_>
+struct BuffersCsr {
+  rmm::device_uvector<Index_> adj_graph;
+  rmm::device_uvector<Index_> adj_graph_f;
+  rmm::device_uvector<std::uint8_t> codes;
+
+  explicit BuffersCsr(cudaStream_t stream)
+    : adj_graph(0, stream), adj_graph_f(0, stream), codes(0, stream)
+  {
+  }
+};
 
 /**
  * Executa o DBSCAN para a grade de k valores de ε por l valores de minPts.
@@ -504,7 +566,8 @@ std::size_t run_multi_grid_codes(const raft::handle_t& handle,
                                  void* workspace,
                                  std::size_t batch_size,
                                  cudaStream_t stream,
-                                 Index_* neigh_medido = nullptr)
+                                 Index_* neigh_medido      = nullptr,
+                                 BuffersCsr<Index_>* buffers = nullptr)
 {
   const std::size_t align     = 256;
   const std::size_t n_configs = static_cast<std::size_t>(n_eps) * n_min_pts;
@@ -532,7 +595,7 @@ std::size_t run_multi_grid_codes(const raft::handle_t& handle,
   ASSERT(static_cast<std::size_t>(N) * batch_size < static_cast<std::size_t>(MAX_LABEL),
          "An overflow occurred with the current choice of precision and the number of samples. "
          "(Max allowed batch size is %ld, but was %ld).",
-         (unsigned long)(MAX_LABEL / N),
+         (unsigned long)((MAX_LABEL - static_cast<Index_>(1)) / N),
          (unsigned long)batch_size);
 
   if (workspace == NULL) {
@@ -560,7 +623,8 @@ std::size_t run_multi_grid_codes(const raft::handle_t& handle,
   Index_* work_buffer = (Index_*)temp;
   temp += labels_size;
 
-  rmm::device_uvector<Index_> adj_graph(0, stream);
+  BuffersCsr<Index_> buffers_locais(stream);
+  auto& adj_graph = (buffers != nullptr ? *buffers : buffers_locais).adj_graph;
   // nnz por (lote, ε), em layout lote-major
   std::vector<Index_> batchadjlen(static_cast<std::size_t>(n_batches) * n_eps, 0);
 
@@ -600,6 +664,11 @@ std::size_t run_multi_grid_codes(const raft::handle_t& handle,
   raft::sparse::WeakCCState state(m);
 
   const Index_ maxadjlen = *std::max_element(batchadjlen.begin(), batchadjlen.end());
+  last_execution_stats().max_nnz = static_cast<long long>(maxadjlen);
+  for (Index_ batch = 0; batch < n_batches; ++batch) {
+    last_execution_stats().total_nnz_max_eps += static_cast<long long>(
+      batchadjlen[static_cast<std::size_t>(batch) * n_eps + (n_eps - 1)]);
+  }
   CUML_LOG_DEBUG("Alocando %ld elementos para o grafo de adjacência", (unsigned long)maxadjlen);
 
   if (neigh_medido != nullptr &&
@@ -719,8 +788,9 @@ std::size_t run_multi_grid_cuvs(const raft::handle_t& handle,
                                 void* workspace,
                                 std::size_t batch_size,
                                 cudaStream_t stream,
-                                Index_* neigh_medido = nullptr,
-                                PerfilMulti* perfil  = nullptr)
+                                Index_* neigh_medido        = nullptr,
+                                PerfilMulti* perfil         = nullptr,
+                                BuffersCsr<Index_>* buffers = nullptr)
 {
   const std::size_t align     = 256;
   const std::size_t n_configs = static_cast<std::size_t>(n_eps) * n_min_pts;
@@ -747,7 +817,7 @@ std::size_t run_multi_grid_cuvs(const raft::handle_t& handle,
   ASSERT(static_cast<std::size_t>(N) * batch_size < static_cast<std::size_t>(MAX_LABEL),
          "An overflow occurred with the current choice of precision and the number of samples. "
          "(Max allowed batch size is %ld, but was %ld).",
-         (unsigned long)(MAX_LABEL / N),
+         (unsigned long)((MAX_LABEL - static_cast<Index_>(1)) / N),
          (unsigned long)batch_size);
 
   if (workspace == NULL) {
@@ -790,10 +860,14 @@ std::size_t run_multi_grid_cuvs(const raft::handle_t& handle,
   const Type_f eps2_max = eps2_h[static_cast<std::size_t>(n_eps) - 1];
 
   // Buffers dimensionados por nnz, que só se conhece depois da busca — mesma estratégia do
-  // cuML, que mantém adj_graph fora do workspace e o redimensiona.
-  rmm::device_uvector<Index_> adj_graph(0, stream);
-  rmm::device_uvector<Index_> adj_graph_f(0, stream);
-  rmm::device_uvector<std::uint8_t> codes(0, stream);
+  // cuML, que mantém adj_graph fora do workspace e o redimensiona. Reaproveitados entre
+  // chamadas quando o chamador passa um BuffersCsr; ver o comentário daquela struct.
+  BuffersCsr<Index_> buffers_locais(stream);
+  BuffersCsr<Index_>& buf = buffers != nullptr ? *buffers : buffers_locais;
+
+  auto& adj_graph   = buf.adj_graph;
+  auto& adj_graph_f = buf.adj_graph_f;
+  auto& codes       = buf.codes;
 
   std::vector<Index_> batchadjlen(static_cast<std::size_t>(n_batches), 0);
   std::vector<Index_> nnz_eps(static_cast<std::size_t>(n_batches) * n_eps, 0);
@@ -803,8 +877,17 @@ std::size_t run_multi_grid_cuvs(const raft::handle_t& handle,
   // heterogêneos a densidade varia entre lotes.
   std::vector<char> anota(static_cast<std::size_t>(n_batches), 1);
 
+  // Cresce sob demanda, e nunca com `resize`.
+  //
+  // `resize` preserva o conteúdo: aloca o buffer novo, COPIA o antigo e só então o libera.
+  // Aqui o conteúdo é sempre reescrito do zero, então a cópia é pura perda — até 9 GB de
+  // device-to-device por crescimento em dados densos — e os dois buffers coexistem, o que
+  // dobra o pico exatamente no regime em que a memória é mais apertada.
   auto ensure = [&](auto& buffer, Index_ needed) {
-    if (static_cast<Index_>(buffer.size()) < needed) buffer.resize(needed, stream);
+    using Buf = std::decay_t<decltype(buffer)>;
+    if (static_cast<std::size_t>(buffer.size()) >= static_cast<std::size_t>(needed)) return;
+    buffer = Buf(0, stream);  // libera antes de pedir o novo
+    buffer = Buf(static_cast<std::size_t>(needed), stream);
   };
 
   // Passagem 1: graus em todos os raios e máscaras de pontos centrais. Ordem reversa para
@@ -826,6 +909,9 @@ std::size_t run_multi_grid_cuvs(const raft::handle_t& handle,
     raft::update_host(&nnz, vd_max + n_points, 1, stream);
     handle.sync_stream(stream);
     batchadjlen[static_cast<std::size_t>(i)] = nnz;
+    last_execution_stats().max_nnz =
+      std::max(last_execution_stats().max_nnz, static_cast<long long>(nnz));
+    last_execution_stats().total_nnz_max_eps += static_cast<long long>(nnz);
 
     // Primeiro ponto em que o grau real é conhecido. Se o lote foi dimensionado por um
     // palpite otimista, é aqui que o CSR estouraria — abortar agora custa uma passagem de
@@ -838,13 +924,20 @@ std::size_t run_multi_grid_cuvs(const raft::handle_t& handle,
 
     // A rota se decide AQUI, com o nnz medido — antes da busca ninguém sabe se o grafo é
     // esparso.
-    anota[static_cast<std::size_t>(i)] =
-      rota_forcada() != 0
-        ? (rota_forcada() == 1)
-        : anotar_compensa(static_cast<long long>(nnz),
-                          static_cast<long long>(N) * n_points,
-                          n_eps,
-                          static_cast<long long>(D));
+    if (multi_eps) {
+      anota[static_cast<std::size_t>(i)] =
+        rota_forcada() != 0
+          ? (rota_forcada() == 1)
+          : anotar_compensa(static_cast<long long>(nnz),
+                            static_cast<long long>(N) * n_points,
+                            n_eps,
+                            static_cast<long long>(D));
+      if (anota[static_cast<std::size_t>(i)]) {
+        ++last_execution_stats().annotated_batches;
+      } else {
+        ++last_execution_stats().dense_batches;
+      }
+    }
 
     if (multi_eps && !anota[static_cast<std::size_t>(i)]) {
       // Rota densa: uma chamada ao cuVS por raio dá os k graus direto, sem CSR e sem
@@ -939,11 +1032,18 @@ std::size_t run_multi_grid_cuvs(const raft::handle_t& handle,
   // codes e adj_graph_f só servem à rota que anota. Se nenhum lote anota, são dezenas de GB
   // que não precisam existir — e é justamente no caso denso, onde a memória é mais
   // apertada, que nenhum lote anota.
-  const bool algum_anota =
-    multi_eps && std::any_of(anota.begin(), anota.end(), [](char c) { return c != 0; });
+  Index_ maxadjlen_anotado = 0;
+  for (std::size_t i = 0; i < anota.size(); ++i) {
+    if (multi_eps && anota[i]) {
+      maxadjlen_anotado = std::max(maxadjlen_anotado, batchadjlen[i]);
+    }
+  }
+  const bool algum_anota = maxadjlen_anotado > 0;
   if (algum_anota) {
-    ensure(codes, maxadjlen);
-    ensure(adj_graph_f, maxadjlen);
+    // Um lote denso nunca usa estes buffers. Dimensioná-los pelo maior CSR global faria
+    // um único lote denso eliminar a economia de memória da decisão adaptativa por lote.
+    ensure(codes, maxadjlen_anotado);
+    ensure(adj_graph_f, maxadjlen_anotado);
   }
 
   // Rotula todas as configurações de um raio, sobre um CSR já pronto. Fatorado porque as
@@ -1031,8 +1131,10 @@ std::size_t run_multi_grid_cuvs(const raft::handle_t& handle,
                                               vd_e,
                                               stream);
         }
-        handle.sync_stream(stream);
 
+        // Sem sync: nada é lido para o host aqui. `nnz_e` vem de nnz_eps, preenchido na
+        // passagem 1. Sincronizar impediria a busca do próximo raio de se sobrepor ao
+        // AdjGraph e à rotulagem deste.
         const Index_ nnz_e = nnz_eps[static_cast<std::size_t>(i) * n_eps + e];
 
         {
@@ -1063,8 +1165,8 @@ std::size_t run_multi_grid_cuvs(const raft::handle_t& handle,
       VertexDeg::run_cuvs<Type_f, Index_>(
         handle, x, N, D, start_vertex_id, n_points, eps2_max, adj, vd_max, stream);
     }
-    handle.sync_stream(stream);
 
+    // Sem sync: `nnz_max` veio de batchadjlen, lido na passagem 1.
     {
       Cronometro t(DBM_FASE(perfil, csr_p2), stream);
       AdjGraph::run<Index_>(handle,
@@ -1207,7 +1309,8 @@ void fit_multi(const raft::handle_t& handle,
                Backend backend                          = Backend::Cuvs,
                Index_ neigh_per_row                     = 0,
                rmm::device_uvector<char>* workspace_externo = nullptr,
-               PerfilMulti* perfil                      = nullptr)
+               PerfilMulti* perfil                      = nullptr,
+               BuffersCsr<Index_>* buffers_externos     = nullptr)
 {
   ASSERT(N > 0, "No rows in the input array. DBSCAN cannot be fitted!");
   ASSERT(n_eps > 0, "At least one eps value is required");
@@ -1219,15 +1322,26 @@ void fit_multi(const raft::handle_t& handle,
 #endif
 
   const bool use_cuvs = backend_uses_cuvs(backend);
+  ExecutionStats& stats = last_execution_stats();
+  stats                 = ExecutionStats{};
 
   if (max_bytes_per_batch == 0) {
     std::size_t free_memory, total_memory;
     RAFT_CUDA_TRY(cudaMemGetInfo(&free_memory, &total_memory));
-    const std::size_t dataset_memory =
-      static_cast<std::size_t>(N) * static_cast<std::size_t>(D) * sizeof(Type_f);
-    // Mesmo critério do cuML: 80% do total, descontando o dataset já residente.
-    max_bytes_per_batch = 80 * total_memory / 100 - dataset_memory;
+    // A consulta ocorre depois de o dataset estar residente. Usar memória total podia
+    // prometer bytes ocupados por outros processos do nó e só descobrir no allocator.
+    // Por outro lado, nas repetições o nosso próprio workspace externo já está alocado:
+    // ele some de `free_memory`, mas é integralmente reutilizável nesta chamada. Somá-lo
+    // de volta mantém o lote estável entre warmup/repeat sem contar memória alheia.
+    const std::size_t reusable_workspace =
+      workspace_externo != nullptr ? workspace_externo->size() : 0;
+    const std::size_t available =
+      reusable_workspace > total_memory - std::min(total_memory, free_memory)
+        ? total_memory
+        : std::min(total_memory, free_memory + reusable_workspace);
+    max_bytes_per_batch = 80 * available / 100;
   }
+  stats.max_bytes_per_batch = max_bytes_per_batch;
 
   // `neigh_per_row` é um palpite sobre os dados, e um palpite errado só se revela depois da
   // busca. Quando o CSR medido não couber, o runner devolve o grau real em vez de estourar,
@@ -1242,6 +1356,15 @@ void fit_multi(const raft::handle_t& handle,
       std::min(compute_batch_size_multi<Index_>(
                  estimated_memory, N, n_eps, n_min_pts, max_bytes_per_batch, use_cuvs, neigh_per_row),
                teto_lote);
+
+    stats.attempts          = tentativa + 1;
+    stats.batch_size        = batch_size;
+    stats.batches           = static_cast<int>((static_cast<std::size_t>(N) + batch_size - 1) /
+                                     batch_size);
+    stats.dense_batches     = 0;
+    stats.annotated_batches = 0;
+    stats.max_nnz           = 0;
+    stats.total_nnz_max_eps = 0;
 
     CUML_LOG_DEBUG(
       "Batch size %zu, memória estimada %.2f MB", batch_size, (double)estimated_memory * 1e-6);
@@ -1264,7 +1387,8 @@ void fit_multi(const raft::handle_t& handle,
                                                    batch_size,
                                                    stream,
                                                    workspace == NULL ? nullptr : &medido,
-                                                   workspace == NULL ? nullptr : perfil);
+                                                   workspace == NULL ? nullptr : perfil,
+                                                   buffers_externos);
       }
 #endif
       return run_multi_grid_codes<Type_f, Index_>(handle,
@@ -1279,16 +1403,20 @@ void fit_multi(const raft::handle_t& handle,
                                                   workspace,
                                                   batch_size,
                                                   stream,
-                                                  workspace == NULL ? nullptr : &medido);
+                                                  workspace == NULL ? nullptr : &medido,
+                                                  buffers_externos);
     };
 
     const std::size_t workspace_size = run(NULL);
 
     if (workspace_externo != nullptr) {
-      // Cresce sob demanda e nunca encolhe: a atribuição descarta o conteúdo antigo em vez
-      // de copiá-lo, que é o certo aqui — o workspace é escrito do zero a cada execução.
-      // Um lote menor na nova tentativa cabe no buffer já alocado, então não realoca.
+      // Cresce sob demanda e nunca encolhe. O orçamento automático pode contar o buffer
+      // atual como memória reutilizável; ao crescer, ele precisa ser liberado ANTES da
+      // nova alocação, pois `device_uvector(workspace_size)` no lado direito coexistiria
+      // temporariamente com o antigo e poderia causar OOM apesar de o orçamento caber.
       if (workspace_externo->size() < workspace_size) {
+        *workspace_externo = rmm::device_uvector<char>(0, stream);
+        handle.sync_stream(stream);
         *workspace_externo = rmm::device_uvector<char>(workspace_size, stream);
       }
       run(workspace_externo->data());
@@ -1300,6 +1428,7 @@ void fit_multi(const raft::handle_t& handle,
     if (medido == 0) return;  // executou
 
     ++csr_correcoes_de_lote();
+    ++stats.batch_corrections;
 
     // Na primeira correção, o grau medido — barato e quase sempre suficiente. Se ainda
     // assim não couber, o lote seguinte era mais denso que o que estourou: aí vai o pior
