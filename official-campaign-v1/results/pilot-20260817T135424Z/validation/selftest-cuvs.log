@@ -1,0 +1,51 @@
+BACKEND      = cuvs
+TARGET       = /home/es112688/dados/dbscanmulti/official-campaign-v1/results/pilot-20260817T135424Z/build/backend-cuvs_arch-sm_80_std-c++17_raft-1/dbscan_multi
+RAFT_INCLUDE = /home/es112688/cuML-DBSCANMulti/.venv/lib/python3.10/site-packages/libraft/include
+RMM_INCLUDE  = /home/es112688/cuML-DBSCANMulti/.venv/lib/python3.10/site-packages/librmm/include
+LOGGER_INCLUDE = /home/es112688/cuML-DBSCANMulti/.venv/lib/python3.10/site-packages/rapids_logger/include
+CUVS_INCLUDE = /home/es112688/cuML-DBSCANMulti/.venv/lib/python3.10/site-packages/libcuvs/include
+CCCL_INCLUDE = /home/es112688/cuML-DBSCANMulti/.venv/lib/python3.10/site-packages/librmm/include/rapids
+  ok      raft/core/error.hpp
+  ok      raft/core/handle.hpp
+  ok      raft/label/classlabels.cuh
+  ok      raft/label/merge_labels.cuh
+  ok      raft/sparse/csr.hpp
+  ok      raft/sparse/convert/csr.cuh
+  ok      raft/util/cuda_dev_essentials.cuh
+  ok      raft/util/cuda_utils.cuh
+  ok      raft/util/cudart_utils.hpp
+  ok      rmm/cuda_stream_view.hpp
+  ok      rmm/device_uvector.hpp
+  ok      rapids_logger/log_levels.h
+  ok      rapids_logger/logger.hpp
+  ok      raft/core/device_mdspan.hpp
+  ok      cuvs/distance/distance.hpp
+  ok      cuvs/neighbors/epsilon_neighborhood.hpp
+  ok      RMM: /home/es112688/cuML-DBSCANMulti/.venv/lib/python3.10/site-packages/librmm/lib64/librmm.so
+  ok      rapids_logger: /home/es112688/cuML-DBSCANMulti/.venv/lib/python3.10/site-packages/rapids_logger/lib64/librapids_logger.so
+  ok      RAFT: /home/es112688/cuML-DBSCANMulti/.venv/lib/python3.10/site-packages/libraft/lib64/libraft.so
+  ok      cuVS: /home/es112688/cuML-DBSCANMulti/.venv/lib/python3.10/site-packages/libcuvs/lib64/libcuvs.so
+{"binary": "/storage/dados/es112688/dbscanmulti/official-campaign-v1/results/pilot-20260817T135424Z/build/backend-cuvs_arch-sm_80_std-c++17_raft-1/dbscan_multi", "build": {"build_id": "backend-cuvs_arch-sm_80_std-c++17_raft-1_rev-fe44743b5ea66e262b6923080cce02cdeb16f0f5", "compiled_backends": ["cuvs", "codes"], "configured_backend": "cuvs", "cuda_arch": "sm_80", "flags": "std=c++17,arch=sm_80,backend=cuvs,link_raft=1", "git_dirty": null, "git_sha": "fe44743b5ea66e262b6923080cce02cdeb16f0f5", "revision_kind": "provided"}, "manifest": "/storage/dados/es112688/dbscanmulti/official-campaign-v1/results/pilot-20260817T135424Z/build/backend-cuvs_arch-sm_80_std-c++17_raft-1/build-config.txt", "sha256": "43aba202a7c4189b16f60b8bea9820fe03b0f80b7cd291fef3876918455064c8"}
+"/home/es112688/dados/dbscanmulti/official-campaign-v1/results/pilot-20260817T135424Z/build/backend-cuvs_arch-sm_80_std-c++17_raft-1/dbscan_multi" --selftest --backend "cuvs" --json
+[selftest] eps=0.3 minPts=4 clusters=3 ruido=22
+[selftest] eps=0.3 minPts=8 clusters=3 ruido=35
+[selftest] eps=0.3 minPts=16 clusters=3 ruido=70
+[selftest] eps=0.5 minPts=4 clusters=3 ruido=2
+[selftest] eps=0.5 minPts=8 clusters=3 ruido=2
+[selftest] eps=0.5 minPts=16 clusters=3 ruido=4
+[selftest] eps=0.8 minPts=4 clusters=3 ruido=0
+[selftest] eps=0.8 minPts=8 clusters=3 ruido=0
+[selftest] eps=0.8 minPts=16 clusters=3 ruido=0
+[selftest] backends: 9/9 configurações idênticas entre cuVS e codes; 9/9 determinísticas em 3 execuções codes
+[selftest] lotes: 4 x 750 pontos, 9/9 configurações idênticas ao lote único
+[selftest] D=2 ok para k = 1, 3 e 5
+[selftest] D=8 ok para k = 1, 3 e 5
+[selftest] D=16 ok para k = 1, 3 e 5
+[selftest] D=32 ok para k = 1, 3 e 5
+[selftest] D=33 ok para k = 1, 3 e 5
+[selftest] alta dimensão codes: idêntico em 5/5 configurações entre D=33 e D=8193
+[selftest] índice: 9/9 configurações idênticas entre int32 e int64 (auto para N=3000 escolheria int32)
+[selftest] lote corrigido (1x): 9/9 configurações idênticas com neigh-per-row mentindo (1) e o CSR apertado
+[selftest] rotas: 9/9 configurações idênticas entre anotar-e-compactar e um CSR por raio
+[selftest] PASSOU
+{"selftest":true,"backend":"cuvs","fit_ms":20.5748,"n":3000,"d":2,"eps":[0.3,0.5,0.8],"min_samples":[4,8,16],"configuration_count":9,"config_order":"eps_major","batches":4,"batch_size":750,"batched_mismatches":0,"index_mismatches":0,"batch_fixup_mismatches":0,"route_mismatches":0,"route_tested":true,"backend_comparison_performed":true,"backend_mismatches":0,"backend_repeat_mismatches":0,"high_dim_mismatches":0,"configurations":[{"eps":0.3,"min_samples":4,"n_clusters":3,"n_noise":22},{"eps":0.3,"min_samples":8,"n_clusters":3,"n_noise":35},{"eps":0.3,"min_samples":16,"n_clusters":3,"n_noise":70},{"eps":0.5,"min_samples":4,"n_clusters":3,"n_noise":2},{"eps":0.5,"min_samples":8,"n_clusters":3,"n_noise":2},{"eps":0.5,"min_samples":16,"n_clusters":3,"n_noise":4},{"eps":0.8,"min_samples":4,"n_clusters":3,"n_noise":0},{"eps":0.8,"min_samples":8,"n_clusters":3,"n_noise":0},{"eps":0.8,"min_samples":16,"n_clusters":3,"n_noise":0}],"build":{"git_sha":"fe44743b5ea66e262b6923080cce02cdeb16f0f5","revision_kind":"provided","git_dirty":null,"build_id":"backend-cuvs_arch-sm_80_std-c++17_raft-1_rev-fe44743b5ea66e262b6923080cce02cdeb16f0f5","cuda_arch":"sm_80","configured_backend":"cuvs","compiled_backends":["cuvs","codes"],"flags":"std=c++17,arch=sm_80,backend=cuvs,link_raft=1"},"cuda":{"runtime_version":12060,"driver_version":12090,"device":0,"gpu_name":"NVIDIA A100-SXM4-80GB","compute_capability":"8.0","total_global_memory":85094825984}}

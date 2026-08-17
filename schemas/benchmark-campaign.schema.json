@@ -1,0 +1,194 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/Math-BUG/cuML-DBSCANMulti/schemas/benchmark-campaign.schema.json",
+  "title": "cuML-DBSCANMulti benchmark campaign specification",
+  "description": "Plano imutável de casos. Não representa resultados nem exige que artefatos de execução existam.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "$schema",
+    "schema_version",
+    "id",
+    "phase",
+    "purpose",
+    "baseline_validation",
+    "protocol",
+    "cases"
+  ],
+  "properties": {
+    "$schema": {"type": "string", "minLength": 1},
+    "schema_version": {"const": "1.0.0"},
+    "id": {"type": "string", "pattern": "^[a-z0-9][a-z0-9._-]*$"},
+    "phase": {"enum": ["pilot", "core"]},
+    "purpose": {"type": "string", "minLength": 1},
+    "baseline_validation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["source_revision", "job_id", "validation_approved"],
+      "properties": {
+        "source_revision": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+        "job_id": {"type": "integer", "minimum": 1},
+        "validation_approved": {"const": true}
+      }
+    },
+    "protocol": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "backend",
+        "index",
+        "neigh_per_row",
+        "max_mbytes_per_batch",
+        "warmup",
+        "measured_samples",
+        "block_design",
+        "eps_quantiles",
+        "minpts_pool_size",
+        "minpts_pool_method",
+        "seed",
+        "dataset_protocol",
+        "methods",
+        "timing_boundary"
+      ],
+      "properties": {
+        "backend": {"enum": ["cuvs", "codes"]},
+        "index": {"enum": ["int32", "int64"]},
+        "neigh_per_row": {"type": "integer", "minimum": 0},
+        "max_mbytes_per_batch": {"type": "integer", "minimum": 1},
+        "warmup": {"type": "integer", "minimum": 1},
+        "measured_samples": {"type": "integer", "minimum": 1},
+        "block_design": {"const": "symmetric"},
+        "eps_quantiles": {
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 16,
+          "uniqueItems": true,
+          "items": {"type": "number", "exclusiveMinimum": 0, "exclusiveMaximum": 1}
+        },
+        "minpts_pool_size": {"type": "integer", "minimum": 2},
+        "minpts_pool_method": {
+          "const": "geometric-rounded-deduplicated-filled-v1",
+          "description": "Use os extremos min/max de meta.min_samples; gere size valores geometricamente espaçados, arredonde ao inteiro mais próximo com empate para o par, preserve os extremos, deduplique, preencha lacunas com inteiros ainda não usados do intervalo inclusivo em ordem crescente e ordene o resultado. Falhe se o intervalo não contiver size inteiros distintos."
+        },
+        "seed": {"type": "integer"},
+        "dataset_protocol": {"const": "knn-sample-rank-v2"},
+        "methods": {
+          "type": "array",
+          "description": "Métodos por caso. Cada rota expande somente multi; os dois sweeps escalares executam uma vez por caso e bloco.",
+          "minItems": 3,
+          "maxItems": 3,
+          "prefixItems": [
+            {"const": "multi"},
+            {"const": "experimental_sequential"},
+            {"const": "cuml_sequential"}
+          ],
+          "items": false
+        },
+        "timing_boundary": {"const": "device-resident-input-to-device-labels"}
+      }
+    },
+    "cases": {
+      "type": "array",
+      "minItems": 1,
+      "items": {"$ref": "#/$defs/case"}
+    }
+  },
+  "$defs": {
+    "case": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "dataset",
+        "n",
+        "eps_indices",
+        "minpts_indices",
+        "routes",
+        "tags"
+      ],
+      "properties": {
+        "id": {"type": "string", "pattern": "^[a-z0-9][a-z0-9._-]*$"},
+        "dataset": {"type": "string", "pattern": "^[a-z][a-z0-9_]*_[1-9][0-9]*d$"},
+        "n": {"type": "integer", "minimum": 1},
+        "index": {
+          "enum": ["int32", "int64"],
+          "description": "Override diagnóstico por caso; ausente usa protocol.index."
+        },
+        "tier": {
+          "enum": ["core", "stress"],
+          "description": "Estrato analítico; casos stress nunca são combinados ao agregado core."
+        },
+        "eps_indices": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 16,
+          "uniqueItems": true,
+          "items": {"type": "integer", "minimum": 0}
+        },
+        "minpts_indices": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {"type": "integer", "minimum": 0}
+        },
+        "routes": {
+          "type": "array",
+          "description": "Rotas do método multi. Não multiplica experimental_sequential nem cuml_sequential.",
+          "minItems": 1,
+          "maxItems": 3,
+          "uniqueItems": true,
+          "contains": {"const": "auto"},
+          "items": {"enum": ["annotated", "dense", "auto"]}
+        },
+        "tags": {
+          "type": "array",
+          "minItems": 2,
+          "uniqueItems": true,
+          "items": {"type": "string", "pattern": "^[a-z0-9][a-z0-9_-]*$"}
+        }
+      },
+      "oneOf": [
+        {
+          "properties": {
+            "tags": {"contains": {"const": "scalar"}},
+            "eps_indices": {"maxItems": 1},
+            "minpts_indices": {"maxItems": 1},
+            "routes": {"const": ["auto"]}
+          }
+        },
+        {
+          "properties": {
+            "tags": {"contains": {"const": "multi-minpts"}},
+            "eps_indices": {"maxItems": 1},
+            "minpts_indices": {"minItems": 2},
+            "routes": {"const": ["auto"]}
+          }
+        },
+        {
+          "properties": {
+            "tags": {"contains": {"const": "multi-eps"}},
+            "eps_indices": {"minItems": 2},
+            "minpts_indices": {"maxItems": 1}
+          }
+        },
+        {
+          "properties": {
+            "tags": {"contains": {"const": "multi-both"}},
+            "eps_indices": {"minItems": 2},
+            "minpts_indices": {"minItems": 2}
+          }
+        }
+      ]
+    }
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"phase": {"const": "pilot"}}},
+      "then": {"properties": {"protocol": {"properties": {"measured_samples": {"const": 2}}}}}
+    },
+    {
+      "if": {"properties": {"phase": {"const": "core"}}},
+      "then": {"properties": {"protocol": {"properties": {"measured_samples": {"const": 10}}}}}
+    }
+  ]
+}

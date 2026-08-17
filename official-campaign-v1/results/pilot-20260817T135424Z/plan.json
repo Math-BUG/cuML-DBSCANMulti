@@ -1,0 +1,13 @@
+{
+  "campaign_id": "dbscanmulti-pilot-v1",
+  "phase": "pilot",
+  "cases": 7,
+  "multi_route_variants_per_block": 13,
+  "method_variants_per_block": 27,
+  "measured_samples_per_method": 2,
+  "symmetric_block_pairs": 1,
+  "raw_measured_records": 54,
+  "underlying_measured_dbscan_fits": 118,
+  "underlying_warmup_dbscan_fits": 118,
+  "underlying_total_dbscan_fits": 236
+}

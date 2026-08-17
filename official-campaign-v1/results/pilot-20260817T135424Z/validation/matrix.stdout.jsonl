@@ -1,0 +1,14 @@
+[1] all_noise_1d: PASS
+[2] one_cluster_duplicates_2d: PASS
+[3] ambiguous_border_2d: PASS
+[4] epsilon_nextafter_1d: PASS
+[5] dimension_1: PASS
+[6] dimension_2: PASS
+[7] dimension_16: PASS
+[8] dimension_33: PASS
+[9] high_dimension_8193: PASS
+[10] forced_batches_2d: PASS
+[11] random_seed_000: PASS
+[12] random_seed_001: PASS
+[13] random_seed_002: PASS
+{"validation_approved": true, "out": "/home/es112688/dados/dbscanmulti/official-campaign-v1/results/pilot-20260817T135424Z/validation/matrix.json"}

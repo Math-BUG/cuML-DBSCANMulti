@@ -69,6 +69,99 @@ def validate_instance(instance_path: Path, schema_path: Path, errors: list[str])
         return {}
 
 
+def check_schema_files(errors: list[str]) -> None:
+    """Valida todos os contratos mesmo quando ainda não existem outputs da campanha."""
+
+    ids: dict[str, Path] = {}
+    for path in sorted((ROOT / "schemas").glob("*.schema.json")):
+        try:
+            schema = read_json(path)
+            if not isinstance(schema, dict):
+                errors.append(f"{path.relative_to(ROOT)}: schema deve ser um objeto JSON")
+                continue
+            if Draft202012Validator is not None:
+                Draft202012Validator.check_schema(schema)
+            elif schema.get("$schema") != "https://json-schema.org/draft/2020-12/schema":
+                errors.append(
+                    f"{path.relative_to(ROOT)}: $schema deve declarar draft 2020-12"
+                )
+            schema_id = schema.get("$id")
+            if not isinstance(schema_id, str) or not schema_id:
+                errors.append(f"{path.relative_to(ROOT)}: $id ausente")
+            elif schema_id in ids:
+                errors.append(
+                    f"{path.relative_to(ROOT)}: $id duplicado com "
+                    f"{ids[schema_id].relative_to(ROOT)}"
+                )
+            else:
+                ids[schema_id] = path
+        except Exception as exc:
+            errors.append(f"{path.relative_to(ROOT)}: schema inválido: {exc}")
+
+
+def check_campaign_cross_fields(spec: dict, path: Path, errors: list[str]) -> None:
+    """Invariantes derivadas que JSON Schema não expressa sem extensões não portáveis."""
+
+    if not isinstance(spec, dict):
+        return
+    protocol = spec.get("protocol", {})
+    cases = spec.get("cases", [])
+    if not isinstance(protocol, dict) or not isinstance(cases, list):
+        return
+
+    eps_count = len(protocol.get("eps_quantiles", []))
+    minpts_count = protocol.get("minpts_pool_size")
+    seen: set[str] = set()
+    family_tags = {"scalar", "multi-minpts", "multi-eps", "multi-both"}
+    for index, case in enumerate(cases):
+        if not isinstance(case, dict):
+            continue
+        prefix = f"{path.relative_to(ROOT)}:cases.{index}"
+        case_id = case.get("id")
+        if case_id in seen:
+            errors.append(f"{prefix}: id duplicado: {case_id!r}")
+        elif isinstance(case_id, str):
+            seen.add(case_id)
+
+        eps_indices = case.get("eps_indices", [])
+        minpts_indices = case.get("minpts_indices", [])
+        if isinstance(eps_indices, list):
+            if eps_indices != sorted(eps_indices):
+                errors.append(f"{prefix}: eps_indices deve estar em ordem crescente")
+            if any(not isinstance(item, int) or item < 0 or item >= eps_count for item in eps_indices):
+                errors.append(f"{prefix}: eps_indices excede a grade de {eps_count} quantis")
+        if isinstance(minpts_indices, list) and isinstance(minpts_count, int):
+            if minpts_indices != sorted(minpts_indices):
+                errors.append(f"{prefix}: minpts_indices deve estar em ordem crescente")
+            if any(
+                not isinstance(item, int) or item < 0 or item >= minpts_count
+                for item in minpts_indices
+            ):
+                errors.append(
+                    f"{prefix}: minpts_indices excede o pool de {minpts_count} valores"
+                )
+
+        tags = set(case.get("tags", [])) if isinstance(case.get("tags"), list) else set()
+        selected_families = tags & family_tags
+        if len(selected_families) != 1:
+            errors.append(f"{prefix}: deve haver exatamente uma tag de família")
+            continue
+        family = next(iter(selected_families))
+        expected_routes = (
+            ["auto"]
+            if "index-overhead" in tags
+            else (
+                ["annotated", "dense", "auto"]
+                if family in {"multi-eps", "multi-both"}
+                else ["auto"]
+            )
+        )
+        if case.get("routes") != expected_routes:
+            errors.append(
+                f"{prefix}: routes de {family} deve ser {expected_routes!r}"
+            )
+
+
 def check_vendor(errors: list[str]) -> None:
     manifest_path = VENDOR_ROOT / "VENDORED.json"
     manifest = read_json(manifest_path)
@@ -315,6 +408,8 @@ def main() -> int:
     args = parser.parse_args()
     errors: list[str] = []
 
+    check_schema_files(errors)
+
     provenance_path = ROOT / "provenance" / "project-status.json"
     project_status = validate_instance(
         provenance_path, ROOT / "schemas" / "provenance-status.schema.json", errors
@@ -326,6 +421,17 @@ def main() -> int:
         )
         manifests.append(manifest)
         check_manifest_cross_fields(manifest, errors)
+
+    campaign_schema = ROOT / "schemas" / "benchmark-campaign.schema.json"
+    for name in ("pilot.json", "core.json"):
+        path = ROOT / "scripts" / "campaigns" / name
+        if not path.is_file():
+            errors.append(f"{path.relative_to(ROOT)}: especificação obrigatória ausente")
+            continue
+        spec = validate_instance(path, campaign_schema, errors)
+        check_campaign_cross_fields(
+            spec if isinstance(spec, dict) else {}, path, errors
+        )
 
     check_vendor(errors)
     check_file_licenses(project_status if isinstance(project_status, dict) else {}, errors)

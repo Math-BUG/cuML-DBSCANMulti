@@ -443,7 +443,7 @@ def main(argv=None) -> int:
                 "path": str(labels_evidence_path),
                 "sha256": sha256_file(labels_evidence_path),
                 "config_order": "eps_major",
-                "arrays": sorted(repetition_labels),
+                "arrays": sorted(f"labels_{source}" for source in repetition_labels),
             }
 
             validation = validate_matrix(

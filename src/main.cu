@@ -542,6 +542,7 @@ std::vector<int> fit_com_handle(const raft::handle_t& handle,
                                                 d_points.data(),
                                                 static_cast<Index_>(n),
                                                 static_cast<Index_>(d),
+                                                eps.data(),
                                                 d_eps2.data(),
                                                 n_eps,
                                                 d_min_pts.data(),
@@ -1615,6 +1616,14 @@ int main(int argc, char** argv)
               << ",\"batch_corrections\":" << execution_stats.batch_corrections
               << ",\"dense_batches\":" << execution_stats.dense_batches
               << ",\"annotated_batches\":" << execution_stats.annotated_batches
+              << ",\"batch_routes\":[";
+    for (std::size_t i = 0; i < execution_stats.batch_routes.size(); ++i) {
+      if (i != 0) std::cout << ",";
+      std::cout << "\""
+                << ML::Dbscan::Multi::batch_route_name(execution_stats.batch_routes[i])
+                << "\"";
+    }
+    std::cout << "]"
               << ",\"route_observed\":\"" << route_observed << "\""
               << ",\"stats_scope\":\"last_measured_repeat\""
               << ",\"max_nnz\":" << execution_stats.max_nnz

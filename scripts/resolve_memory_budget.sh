@@ -38,12 +38,11 @@ if [[ ! "$percent" =~ ^[0-9]+$ ]] || [ "$percent" -lt 1 ] || [ "$percent" -gt 95
   exit 2
 fi
 
-free_mb="$(
-  nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits \
-    | sed -n '1p' | tr -d '[:space:]'
-)"
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+python_bin="${PYTHON:-python}"
+free_mb="$("$python_bin" "$script_dir/query_cuda_device.py" --field free_memory_mib)"
 if [[ ! "$free_mb" =~ ^[0-9]+$ ]] || [ "$free_mb" -le 0 ]; then
-  echo "erro: não foi possível obter memory.free via nvidia-smi: '$free_mb'" >&2
+  echo "erro: não foi possível obter a memória livre da GPU CUDA visível: '$free_mb'" >&2
   exit 2
 fi
 

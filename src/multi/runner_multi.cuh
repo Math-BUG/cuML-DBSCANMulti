@@ -17,7 +17,7 @@
  *  3. compute_batch_size passa a considerar k e l ao estimar a memória.
  *
  * A busca de vizinhança NÃO foi reescrita: continua sendo a chamada ao cuVS que o DBSCAN do
- * cuML faz (ver vertexdeg_cuvs.cuh). A funcionalidade multi entra depois dela, sobre o CSR
+ * cuML faz (ver cuml_stages.cuh). A funcionalidade multi entra depois dela, sobre o CSR
  * que o AdjGraph do cuML constrói (ver csr_multi_eps.cuh). É onde está o ganho:
  *
  *   - a distância par-a-par, O(N² · D), roda uma vez por lote — no MAIOR raio, cujo CSR
@@ -42,22 +42,17 @@
 #pragma once
 
 #include "corepoints_multi.cuh"
+#include "cuml_stages.cuh"
 #include "eps_neighborhood.cuh"
 
 #ifdef DBSCANMULTI_USE_CUVS
 #include "csr_multi_eps.cuh"
-#include "vertexdeg_cuvs.cuh"
 #endif
-
-#include <adjgraph/runner.cuh>
-#include <mergelabels/runner.cuh>
 
 #include <cuml/common/logger.hpp>
 
 #include <raft/core/error.hpp>
 #include <raft/core/handle.hpp>
-#include <raft/label/classlabels.cuh>
-#include <raft/sparse/csr.hpp>
 #include <raft/util/cuda_dev_essentials.cuh>  // raft::alignTo
 #include <raft/util/cuda_utils.cuh>
 #include <raft/util/cudart_utils.hpp>
@@ -74,37 +69,6 @@
 namespace ML {
 namespace Dbscan {
 namespace Multi {
-
-static const int TPB = 256;
-
-/**
- * Ajusta os rótulos do primitivo weak_cc para o padrão do scikit-learn:
- * MAX_LABEL vira -1 (ruído) e os demais são decrementados.
- * Cópia de ML::Dbscan::relabelForSkl (runner.cuh do cuML).
- */
-template <typename Index_ = int>
-__global__ void relabelForSkl(Index_* labels, Index_ N, Index_ MAX_LABEL)
-{
-  Index_ tid = threadIdx.x + blockDim.x * blockIdx.x;
-  if (tid < N) {
-    if (labels[tid] == MAX_LABEL) {
-      labels[tid] = -1;
-    } else {
-      --labels[tid];
-    }
-  }
-}
-
-/** Cópia de ML::Dbscan::final_relabel (runner.cuh do cuML). */
-template <typename Index_ = int>
-void final_relabel(Index_* db_cluster, Index_ N, cudaStream_t stream)
-{
-  Index_ MAX_LABEL = std::numeric_limits<Index_>::max();
-  raft::label::make_monotonic(
-    db_cluster, db_cluster, N, stream, [MAX_LABEL] __device__(Index_ val) {
-      return val == MAX_LABEL;
-    });
-}
 
 /**
  * Memória que cada linha do lote consome: adjacência booleana, código de ε, a fatia do CSR
@@ -195,6 +159,18 @@ inline int& csr_correcoes_de_lote()
   return n;
 }
 
+/** Rota efetivamente usada por um lote na última chamada. */
+enum class BatchRoute : std::uint8_t { NotApplicable, Annotated, Dense };
+
+inline const char* batch_route_name(BatchRoute route)
+{
+  switch (route) {
+    case BatchRoute::Annotated: return "annotated";
+    case BatchRoute::Dense: return "dense";
+    default: return "not-applicable";
+  }
+}
+
 /** Metadados da última chamada, usados para tornar cada JSON experimental auditável. */
 struct ExecutionStats {
   std::size_t max_bytes_per_batch = 0;
@@ -204,8 +180,25 @@ struct ExecutionStats {
   int batch_corrections           = 0;
   int dense_batches               = 0;
   int annotated_batches           = 0;
+  /** Uma entrada por lote, em ordem crescente do índice do lote. */
+  std::vector<BatchRoute> batch_routes;
   long long max_nnz               = 0;
   long long total_nnz_max_eps     = 0;
+
+  /** Zera a amostra sem liberar a capacidade adquirida pelo warmup. */
+  void reset_preserving_capacity() noexcept
+  {
+    max_bytes_per_batch = 0;
+    batch_size          = 0;
+    batches             = 0;
+    attempts            = 0;
+    batch_corrections   = 0;
+    dense_batches       = 0;
+    annotated_batches   = 0;
+    batch_routes.clear();
+    max_nnz           = 0;
+    total_nnz_max_eps = 0;
+  }
 };
 
 inline ExecutionStats& last_execution_stats()
@@ -745,13 +738,10 @@ std::size_t run_multi_grid_codes(const raft::handle_t& handle,
     }
   }
 
-  // Relabel final, por configuração.
-  const std::size_t nblks = (static_cast<std::size_t>(N) + TPB - 1) / TPB;
+  // Relabel final, por configuração, com as primitivas RAFT/Thrust do cuML.
   for (std::size_t config = 0; config < n_configs; ++config) {
     Index_* out = labels + config * static_cast<std::size_t>(N);
-    final_relabel<Index_>(out, N, stream);
-    relabelForSkl<Index_><<<nblks, TPB, 0, stream>>>(out, N, MAX_LABEL);
-    RAFT_CUDA_TRY(cudaPeekAtLastError());
+    CumlStages::relabel_for_sklearn<Index_>(handle, out, N, stream);
   }
 
   CUML_LOG_DEBUG("Done.");
@@ -774,12 +764,16 @@ std::size_t run_multi_grid_codes(const raft::handle_t& handle,
  *   5. por configuração, weak_cc_batched + MergeLabels do cuML, intocados.
  *
  * Com k = 1 os passos 3 e 4 não existem e o caminho é, kernel a kernel, o do cuML.
+ *
+ * @param[in] eps_host k raios originais no host, em ordem CRESCENTE; o VertexDeg do
+ *                     cuML eleva cada raio ao quadrado internamente
  */
 template <typename Type_f, typename Index_ = int>
 std::size_t run_multi_grid_cuvs(const raft::handle_t& handle,
                                 const Type_f* x,
                                 Index_ N,
                                 Index_ D,
+                                const Type_f* eps_host,
                                 const Type_f* eps2,
                                 int n_eps,
                                 const Index_* min_pts,
@@ -851,13 +845,9 @@ std::size_t run_multi_grid_cuvs(const raft::handle_t& handle,
   // Graus do maior raio: é o que o cuVS preenche e o que o AdjGraph consome.
   Index_* vd_max = vd + static_cast<std::size_t>(n_eps - 1) * vd_stride;
 
-  // O cuVS recebe o raio ao quadrado por valor, então todos os k vêm para o host: a rota
-  // densa chama o cuVS uma vez por raio. A versão em device continua servindo à anotação,
-  // que compara os k de dentro do kernel.
-  std::vector<Type_f> eps2_h(static_cast<std::size_t>(n_eps));
-  raft::update_host(eps2_h.data(), eps2, n_eps, stream);
-  handle.sync_stream(stream);
-  const Type_f eps2_max = eps2_h[static_cast<std::size_t>(n_eps) - 1];
+  // VertexDeg::run recebe o raio original e faz eps*eps internamente. A cópia em device ao
+  // quadrado continua servindo à anotação, que compara os k valores dentro do kernel.
+  const Type_f eps_max = eps_host[static_cast<std::size_t>(n_eps) - 1];
 
   // Buffers dimensionados por nnz, que só se conhece depois da busca — mesma estratégia do
   // cuML, que mantém adj_graph fora do workspace e o redimensiona. Reaproveitados entre
@@ -901,8 +891,8 @@ std::size_t run_multi_grid_cuvs(const raft::handle_t& handle,
 
     {
       Cronometro t(DBM_FASE(perfil, busca_p1), stream);
-      VertexDeg::run_cuvs<Type_f, Index_>(
-        handle, x, N, D, start_vertex_id, n_points, eps2_max, adj, vd_max, stream);
+      CumlStages::vertex_degree_l2<Type_f, Index_>(
+        handle, x, N, D, start_vertex_id, n_points, eps_max, adj, vd_max, stream);
     }
 
     Index_ nnz = 0;
@@ -934,8 +924,11 @@ std::size_t run_multi_grid_cuvs(const raft::handle_t& handle,
                             static_cast<long long>(D));
       if (anota[static_cast<std::size_t>(i)]) {
         ++last_execution_stats().annotated_batches;
+        last_execution_stats().batch_routes[static_cast<std::size_t>(i)] =
+          BatchRoute::Annotated;
       } else {
         ++last_execution_stats().dense_batches;
+        last_execution_stats().batch_routes[static_cast<std::size_t>(i)] = BatchRoute::Dense;
       }
     }
 
@@ -946,16 +939,17 @@ std::size_t run_multi_grid_cuvs(const raft::handle_t& handle,
       // O maior raio já foi calculado acima e seus graus estão em vd_max.
       Cronometro t(DBM_FASE(perfil, busca_p1), stream);
       for (int e = 0; e < n_eps - 1; ++e) {
-        VertexDeg::run_cuvs<Type_f, Index_>(handle,
-                                            x,
-                                            N,
-                                            D,
-                                            start_vertex_id,
-                                            n_points,
-                                            eps2_h[static_cast<std::size_t>(e)],
-                                            adj,
-                                            vd + static_cast<std::size_t>(e) * vd_stride,
-                                            stream);
+        CumlStages::vertex_degree_l2<Type_f, Index_>(
+          handle,
+          x,
+          N,
+          D,
+          start_vertex_id,
+          n_points,
+          eps_host[static_cast<std::size_t>(e)],
+          adj,
+          vd + static_cast<std::size_t>(e) * vd_stride,
+          stream);
       }
     } else if (multi_eps) {
       ensure(adj_graph, nnz);
@@ -1120,16 +1114,16 @@ std::size_t run_multi_grid_cuvs(const raft::handle_t& handle,
 
         {
           Cronometro t(DBM_FASE(perfil, busca_p2), stream);
-          VertexDeg::run_cuvs<Type_f, Index_>(handle,
-                                              x,
-                                              N,
-                                              D,
-                                              start_vertex_id,
-                                              n_points,
-                                              eps2_h[static_cast<std::size_t>(e)],
-                                              adj,
-                                              vd_e,
-                                              stream);
+          CumlStages::vertex_degree_l2<Type_f, Index_>(handle,
+                                                       x,
+                                                       N,
+                                                       D,
+                                                       start_vertex_id,
+                                                       n_points,
+                                                       eps_host[static_cast<std::size_t>(e)],
+                                                       adj,
+                                                       vd_e,
+                                                       stream);
         }
 
         // Sem sync: nada é lido para o host aqui. `nnz_e` vem de nnz_eps, preenchido na
@@ -1162,8 +1156,8 @@ std::size_t run_multi_grid_cuvs(const raft::handle_t& handle,
     // ---- rota esparsa: um CSR no maior raio, anotado, e os menores por compactação -----
     if (i > 0 || !adj_do_lote0_vale) {
       Cronometro t(DBM_FASE(perfil, busca_p2), stream);
-      VertexDeg::run_cuvs<Type_f, Index_>(
-        handle, x, N, D, start_vertex_id, n_points, eps2_max, adj, vd_max, stream);
+      CumlStages::vertex_degree_l2<Type_f, Index_>(
+        handle, x, N, D, start_vertex_id, n_points, eps_max, adj, vd_max, stream);
     }
 
     // Sem sync: `nnz_max` veio de batchadjlen, lido na passagem 1.
@@ -1233,12 +1227,9 @@ std::size_t run_multi_grid_cuvs(const raft::handle_t& handle,
 
   {
     Cronometro t(DBM_FASE(perfil, relabel), stream);
-    const std::size_t nblks = (static_cast<std::size_t>(N) + TPB - 1) / TPB;
     for (std::size_t config = 0; config < n_configs; ++config) {
       Index_* out = labels + config * static_cast<std::size_t>(N);
-      final_relabel<Index_>(out, N, stream);
-      relabelForSkl<Index_><<<nblks, TPB, 0, stream>>>(out, N, MAX_LABEL);
-      RAFT_CUDA_TRY(cudaPeekAtLastError());
+      CumlStages::relabel_for_sklearn<Index_>(handle, out, N, stream);
     }
   }
 
@@ -1280,6 +1271,8 @@ inline bool backend_uses_cuvs(Backend backend)
  * @param[in] max_bytes_per_batch  orçamento de memória; 0 = estimar a partir da GPU
  * @param[in] backend              busca de vizinhança: cuVS (padrão, é a do cuML) ou o
  *                                 kernel de códigos
+ * @param[in] eps_host             raios originais no host; o VertexDeg do cuML calcula
+ *                                 eps² internamente. O backend codes usa `eps2` no device.
  * @param[in] neigh_per_row        vizinhos esperados por linha para dimensionar o lote;
  *                                 0 = pior caso N, o padrão do cuML. É um palpite sobre os
  *                                 dados: se o grau real for maior, o lote sai grande demais
@@ -1299,6 +1292,7 @@ void fit_multi(const raft::handle_t& handle,
                const Type_f* x,
                Index_ N,
                Index_ D,
+               const Type_f* eps_host,
                const Type_f* eps2,
                int n_eps,
                const Index_* min_pts,
@@ -1323,7 +1317,7 @@ void fit_multi(const raft::handle_t& handle,
 
   const bool use_cuvs = backend_uses_cuvs(backend);
   ExecutionStats& stats = last_execution_stats();
-  stats                 = ExecutionStats{};
+  stats.reset_preserving_capacity();
 
   if (max_bytes_per_batch == 0) {
     std::size_t free_memory, total_memory;
@@ -1363,6 +1357,9 @@ void fit_multi(const raft::handle_t& handle,
                                      batch_size);
     stats.dense_batches     = 0;
     stats.annotated_batches = 0;
+    stats.batch_routes.clear();
+    stats.batch_routes.resize(static_cast<std::size_t>(stats.batches),
+                              BatchRoute::NotApplicable);
     stats.max_nnz           = 0;
     stats.total_nnz_max_eps = 0;
 
@@ -1378,6 +1375,7 @@ void fit_multi(const raft::handle_t& handle,
                                                    x,
                                                    N,
                                                    D,
+                                                   eps_host,
                                                    eps2,
                                                    n_eps,
                                                    min_pts,

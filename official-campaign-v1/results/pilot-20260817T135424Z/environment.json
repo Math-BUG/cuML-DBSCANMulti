@@ -1,0 +1,19 @@
+{
+  "compute_capability": "8.0",
+  "compute_capability_digits": "80",
+  "cuda_arch": "sm_80",
+  "cuda_driver_version": 12090,
+  "cuda_runtime_version": 12090,
+  "cuda_visible_devices": "0",
+  "cupy_version": "14.1.1",
+  "free_memory_bytes": 84651409408,
+  "free_memory_mib": 80729,
+  "logical_device": 0,
+  "name": "NVIDIA A100-SXM4-80GB",
+  "nvidia_driver_version": "575.57.08",
+  "pci_bus_id": "0000:07:00.0",
+  "total_memory_bytes": 85094825984,
+  "total_memory_mib": 81152,
+  "uuid": "GPU-b74e64b4-ff88-4b31-a68d-8c8dfe4017dc",
+  "visible_device_count": 1
+}

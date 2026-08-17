@@ -203,6 +203,7 @@ def validar_contrato_runtime(
     eps,
     min_samples,
     index="auto",
+    route=None,
     permitir_binario_legado=False,
 ):
     """Rejeita silenciosamente impossível: binário/backend/grade diferentes do pedido."""
@@ -251,6 +252,90 @@ def validar_contrato_runtime(
             f"shape runtime N={resultado.get('n')!r}, D={resultado.get('d')!r}; "
             f"solicitado N={int(n)}, D={int(d)}"
         )
+
+    if route is not None:
+        if type(route) is not str or route not in {"auto", "annotated", "dense"}:
+            erros.append(f"route solicitada inválida: {route!r}")
+        if resultado.get("requested_route") != route:
+            erros.append(
+                f"requested_route={resultado.get('requested_route')!r}; solicitado {route!r}"
+            )
+
+        execution = resultado.get("execution")
+        if not isinstance(execution, dict):
+            erros.append("execution ausente ou não é objeto")
+        else:
+            batches = execution.get("batches")
+            batch_routes = execution.get("batch_routes")
+            if type(batches) is not int or batches <= 0:
+                erros.append(f"execution.batches inválido: {batches!r}")
+            if not isinstance(batch_routes, list):
+                erros.append("execution.batch_routes ausente ou não é lista")
+            else:
+                allowed_routes = {"annotated", "dense", "not-applicable"}
+                invalid_routes = [
+                    value
+                    for value in batch_routes
+                    if type(value) is not str or value not in allowed_routes
+                ]
+                if invalid_routes:
+                    erros.append(
+                        "execution.batch_routes contém valores inválidos: "
+                        f"{invalid_routes!r}"
+                    )
+                if type(batches) is int and batches > 0 and len(batch_routes) != batches:
+                    erros.append(
+                        f"execution.batch_routes tem {len(batch_routes)} itens; "
+                        f"esperado execution.batches={batches}"
+                    )
+
+                if not invalid_routes:
+                    annotated = batch_routes.count("annotated")
+                    dense = batch_routes.count("dense")
+                    not_applicable = batch_routes.count("not-applicable")
+                    if execution.get("annotated_batches") != annotated:
+                        erros.append(
+                            "execution.annotated_batches diverge de batch_routes: "
+                            f"{execution.get('annotated_batches')!r} != {annotated}"
+                        )
+                    if execution.get("dense_batches") != dense:
+                        erros.append(
+                            "execution.dense_batches diverge de batch_routes: "
+                            f"{execution.get('dense_batches')!r} != {dense}"
+                        )
+
+                    route_applies = backend == "cuvs" and len(eps) > 1
+                    if route_applies:
+                        if not_applicable:
+                            erros.append(
+                                "execution.batch_routes marcou not-applicable em Multi-EPS cuVS"
+                            )
+                        if type(route) is str and route in {"annotated", "dense"} and any(
+                            value != route for value in batch_routes
+                        ):
+                            erros.append(
+                                f"rota forçada {route!r} não foi usada em todos os lotes: "
+                                f"{batch_routes!r}"
+                            )
+                    elif any(value != "not-applicable" for value in batch_routes):
+                        erros.append(
+                            "execution.batch_routes deve ser not-applicable fora de "
+                            "Multi-EPS cuVS"
+                        )
+
+                    if annotated and dense:
+                        observed = "mixed"
+                    elif annotated:
+                        observed = "annotated"
+                    elif dense:
+                        observed = "dense"
+                    else:
+                        observed = "not-applicable"
+                    if execution.get("route_observed") != observed:
+                        erros.append(
+                            "execution.route_observed diverge de batch_routes: "
+                            f"{execution.get('route_observed')!r} != {observed!r}"
+                        )
 
     build = resultado.get("build")
     configured_backend = build.get("configured_backend") if isinstance(build, dict) else None
@@ -328,7 +413,7 @@ def ler_labels_config_major(path, n, configuration_count):
 
 def rodar_binario(binario, input_path, n, d, eps, min_samples, repeat, warmup,
                    max_mbytes, backend, index, neigh_per_row, saida_labels=None,
-                  solo=False, permitir_binario_legado=False):
+                  solo=False, permitir_binario_legado=False, route=None):
     """Roda o executável CUDA e devolve (json_resultado, rotulos ou None).
 
     Os rótulos saem em ordem config-major: bloco de n int32 por configuração, com as
@@ -347,6 +432,8 @@ def rodar_binario(binario, input_path, n, d, eps, min_samples, repeat, warmup,
         "--index", index,
         "--json",
     ]
+    if route is not None:
+        cmd += ["--route", route]
     if neigh_per_row:
         cmd += ["--neigh-per-row", str(neigh_per_row)]
     if solo:
@@ -379,6 +466,7 @@ def rodar_binario(binario, input_path, n, d, eps, min_samples, repeat, warmup,
         eps=eps,
         min_samples=min_samples,
         index=index,
+        route=route,
         permitir_binario_legado=permitir_binario_legado,
     )
 
@@ -663,6 +751,12 @@ def main():
                    help="tipo de índice do nosso binário. O cuml.cluster.DBSCAN usa int32 "
                         "e não expõe escolha, então int64 é uma vantagem que ele não tem — "
                         "veja ganho_multi_puro para separar os dois efeitos")
+    p.add_argument(
+        "--route",
+        default="auto",
+        choices=("auto", "annotated", "dense"),
+        help="rota Multi-EPS do binário cuVS; auto preserva a seleção por lote",
+    )
     p.add_argument("--neigh-per-row", type=int, default=0,
                    help="vizinhos esperados por linha ao dimensionar o lote (0 = pior caso "
                         "N, como o cuML). Também não é exposto pelo cuml.cluster.DBSCAN")
@@ -719,6 +813,8 @@ def main():
         p.error("--oraculo-max-n deve ser >= 0")
     if args.max_mbytes_per_batch < 0:
         p.error("--max-mbytes-per-batch deve ser >= 0")
+    if args.backend != "cuvs" and args.route != "auto":
+        p.error("--route annotated|dense só se aplica ao backend cuvs")
 
     nome, input_path, n, d, eps, min_samples, meta_points_sha256 = carregar_config(args)
     k, l = len(eps), len(min_samples)
@@ -750,7 +846,7 @@ def main():
     print(f"grade:   {k} eps x {l} minPts = {n_cfg} configurações")
     print(f"eps:     {[round(e, 5) for e in eps]}")
     print(f"minPts:  {min_samples}")
-    print(f"backend: {args.backend}  índice: {args.index}"
+    print(f"backend: {args.backend}  índice: {args.index}  rota: {args.route}"
           f"{f'  neigh/linha: {args.neigh_per_row}' if args.neigh_per_row else ''}")
     print(f"medição: warmup={args.warmup} repeat={args.repeat} (mediana)\n")
     if args.max_mbytes_per_batch == 0:
@@ -779,7 +875,8 @@ def main():
         args.repeat, args.warmup, args.max_mbytes_per_batch, args.backend,
         args.index, args.neigh_per_row, labels_path,
         solo=args.imposto and not args.imposto_por_processo,
-        permitir_binario_legado=args.permitir_binario_legado)
+        permitir_binario_legado=args.permitir_binario_legado,
+        route=args.route)
     multi_ms = float(nosso["fit_ms"])
     build_runtime = nosso.get("build")
     build_identificado = bool(
@@ -879,6 +976,7 @@ def main():
         "backend_solicitado": args.backend,
         "index": nosso["index"],
         "index_solicitado": args.index,
+        "requested_route": nosso["requested_route"],
         "permitiu_binario_legado": args.permitir_binario_legado,
         "proveniencia_incompleta": proveniencia_incompleta,
         "neigh_per_row": args.neigh_per_row,
@@ -952,7 +1050,8 @@ def main():
                     args.binario, input_path, n, d, [c["eps"]], [c["min_samples"]],
                     args.repeat, args.warmup, args.max_mbytes_per_batch, args.backend,
                     args.index, args.neigh_per_row, None,
-                    permitir_binario_legado=args.permitir_binario_legado)
+                    permitir_binario_legado=args.permitir_binario_legado,
+                    route=args.route)
                 solos.append(float(r["fit_ms"]))
         else:
             solos = nosso.get("solo_ms")

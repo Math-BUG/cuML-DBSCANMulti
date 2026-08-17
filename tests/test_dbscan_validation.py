@@ -27,6 +27,7 @@ from tools.dbscan_validation import (
     sha256_array,
     write_failure_artifact,
 )
+from tools.gerar_datasets import DATASET_PROTOCOL
 from tools.validate_dbscan_matrix import (
     _csv_floats as matrix_csv_floats,
     _csv_ints as matrix_csv_ints,
@@ -285,6 +286,7 @@ def test_meta_requires_points_hash_unless_legacy_is_explicit(tmp_path):
     np.asarray([[0.0], [1.0]], dtype=np.float32).tofile(points)
     meta_path = tmp_path / "dataset.json"
     base_meta = {
+        "protocolo_dataset": DATASET_PROTOCOL,
         "dataset": "tiny",
         "n": 2,
         "d": 1,

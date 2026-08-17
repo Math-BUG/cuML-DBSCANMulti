@@ -1,0 +1,269 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/Math-BUG/cuML-DBSCANMulti/schemas/benchmark-run-manifest.schema.json",
+  "title": "cuML-DBSCANMulti benchmark run manifest",
+  "description": "Identidade e completude de uma execução de campanha; referencia dados raw, não os substitui.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "$schema",
+    "schema_version",
+    "id",
+    "campaign_id",
+    "phase",
+    "purpose",
+    "status",
+    "created_at",
+    "completed_at",
+    "campaign_spec",
+    "filters",
+    "snapshot",
+    "protocol",
+    "validation_gate",
+    "planned",
+    "observed",
+    "artifacts",
+    "failures"
+  ],
+  "properties": {
+    "$schema": {"type": "string", "minLength": 1},
+    "schema_version": {"const": "1.0.0"},
+    "id": {"$ref": "#/$defs/id"},
+    "campaign_id": {"$ref": "#/$defs/id"},
+    "phase": {"enum": ["pilot", "core"]},
+    "purpose": {"type": "string", "minLength": 1},
+    "status": {"enum": ["planned", "running", "completed", "partial", "failed"]},
+    "created_at": {"type": "string", "format": "date-time"},
+    "completed_at": {"type": ["string", "null"], "format": "date-time"},
+    "campaign_spec": {"$ref": "#/$defs/artifactRequired"},
+    "filters": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "case_tiers",
+        "primary_inference_tiers",
+        "excluded_from_primary_inference",
+        "pooled_across_cases"
+      ],
+      "properties": {
+        "case_tiers": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {"enum": ["pilot", "core", "stress"]}
+        },
+        "primary_inference_tiers": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {"enum": ["pilot", "core"]}
+        },
+        "excluded_from_primary_inference": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {"enum": ["stress"]}
+        },
+        "pooled_across_cases": {"const": false}
+      }
+    },
+    "snapshot": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "source_revision",
+        "revision_kind",
+        "source_tree_sha256",
+        "source_dirty",
+        "binary_sha256",
+        "build_id"
+      ],
+      "properties": {
+        "source_revision": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+        "revision_kind": {"enum": ["git", "source-tree-sha256", "provided"]},
+        "source_tree_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$",
+          "description": "SHA-256 completo calculado pelo harness; source_revision guarda o prefixo de 40 hex do binario."
+        },
+        "source_dirty": {
+          "type": ["boolean", "null"],
+          "description": "null para árvore copiada ao cluster sem metadados Git."
+        },
+        "binary_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "build_id": {"type": "string", "minLength": 1}
+      }
+    },
+    "protocol": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "backend",
+        "index",
+        "neigh_per_row",
+        "max_mbytes_per_batch",
+        "warmup",
+        "measured_samples",
+        "block_design",
+        "methods",
+        "timing_boundary"
+      ],
+      "properties": {
+        "backend": {"enum": ["cuvs", "codes"]},
+        "index": {"enum": ["int32", "int64"]},
+        "neigh_per_row": {"type": "integer", "minimum": 0},
+        "max_mbytes_per_batch": {"type": "integer", "minimum": 1},
+        "warmup": {"type": "integer", "minimum": 1},
+        "measured_samples": {"type": "integer", "minimum": 1},
+        "block_design": {"const": "symmetric"},
+        "methods": {
+          "type": "array",
+          "minItems": 3,
+          "maxItems": 3,
+          "uniqueItems": true,
+          "items": {"enum": ["multi", "experimental_sequential", "cuml_sequential"]}
+        },
+        "timing_boundary": {"const": "device-resident-input-to-device-labels"}
+      }
+    },
+    "validation_gate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["job_id", "source_revision", "validation_approved", "checked_at"],
+      "properties": {
+        "job_id": {"type": "integer", "minimum": 1},
+        "source_revision": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+        "validation_approved": {"type": "boolean"},
+        "checked_at": {"type": ["string", "null"], "format": "date-time"}
+      }
+    },
+    "planned": {"$ref": "#/$defs/counts"},
+    "observed": {"$ref": "#/$defs/counts"},
+    "artifacts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "environment_json",
+        "cases_json",
+        "raw_jsonl",
+        "summary_json",
+        "summary_csv",
+        "stdout_log",
+        "stderr_log",
+        "validation_matrix",
+        "lockfile",
+        "dataset_hashes",
+        "campaign_schema",
+        "sample_schema",
+        "run_manifest_schema",
+        "pilot_manifest"
+      ],
+      "properties": {
+        "environment_json": {"$ref": "#/$defs/artifact"},
+        "cases_json": {"$ref": "#/$defs/artifact"},
+        "raw_jsonl": {"$ref": "#/$defs/artifact"},
+        "summary_json": {"$ref": "#/$defs/artifact"},
+        "summary_csv": {"$ref": "#/$defs/artifact"},
+        "stdout_log": {"$ref": "#/$defs/artifact"},
+        "stderr_log": {"$ref": "#/$defs/artifact"},
+        "validation_matrix": {"$ref": "#/$defs/artifact"},
+        "lockfile": {"$ref": "#/$defs/artifact"},
+        "dataset_hashes": {"$ref": "#/$defs/artifact"},
+        "campaign_schema": {"$ref": "#/$defs/artifact"},
+        "sample_schema": {"$ref": "#/$defs/artifact"},
+        "run_manifest_schema": {"$ref": "#/$defs/artifact"},
+        "pilot_manifest": {"$ref": "#/$defs/artifact"}
+      }
+    },
+    "failures": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["case_id", "sample_id", "type", "message", "artifact"],
+        "properties": {
+          "case_id": {"$ref": "#/$defs/id"},
+          "sample_id": {"type": ["string", "null"], "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$"},
+          "type": {"type": "string", "minLength": 1},
+          "message": {"type": "string", "minLength": 1},
+          "artifact": {"$ref": "#/$defs/artifact"}
+        }
+      }
+    }
+  },
+  "$defs": {
+    "id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$"},
+    "artifactRequired": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "sha256"],
+      "properties": {
+        "path": {"type": "string", "minLength": 1},
+        "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      }
+    },
+    "artifact": {
+      "oneOf": [
+        {"type": "null"},
+        {"$ref": "#/$defs/artifactRequired"}
+      ]
+    },
+    "counts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["cases", "method_runs", "warmups", "measured_samples", "valid", "failed", "semantic_rejected"],
+      "properties": {
+        "cases": {"type": "integer", "minimum": 0},
+        "method_runs": {"type": "integer", "minimum": 0},
+        "warmups": {"type": "integer", "minimum": 0},
+        "measured_samples": {"type": "integer", "minimum": 0},
+        "valid": {"type": "integer", "minimum": 0},
+        "failed": {"type": "integer", "minimum": 0},
+        "semantic_rejected": {"type": "integer", "minimum": 0}
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"status": {"const": "completed"}}, "required": ["status"]},
+      "then": {
+        "properties": {
+          "completed_at": {"type": "string", "format": "date-time"},
+          "validation_gate": {"properties": {"validation_approved": {"const": true}}},
+          "artifacts": {
+            "properties": {
+              "environment_json": {"$ref": "#/$defs/artifactRequired"},
+              "cases_json": {"$ref": "#/$defs/artifactRequired"},
+              "raw_jsonl": {"$ref": "#/$defs/artifactRequired"},
+              "summary_json": {"$ref": "#/$defs/artifactRequired"},
+              "summary_csv": {"$ref": "#/$defs/artifactRequired"},
+              "validation_matrix": {"$ref": "#/$defs/artifactRequired"},
+              "lockfile": {"$ref": "#/$defs/artifactRequired"},
+              "dataset_hashes": {"$ref": "#/$defs/artifactRequired"},
+              "campaign_schema": {"$ref": "#/$defs/artifactRequired"},
+              "sample_schema": {"$ref": "#/$defs/artifactRequired"},
+              "run_manifest_schema": {"$ref": "#/$defs/artifactRequired"}
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "phase": {"const": "core"},
+          "status": {"const": "completed"}
+        },
+        "required": ["phase", "status"]
+      },
+      "then": {
+        "properties": {
+          "artifacts": {
+            "properties": {
+              "pilot_manifest": {"$ref": "#/$defs/artifactRequired"}
+            }
+          }
+        }
+      }
+    }
+  ]
+}

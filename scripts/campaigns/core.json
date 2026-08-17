@@ -1,0 +1,354 @@
+{
+  "$schema": "https://github.com/Math-BUG/cuML-DBSCANMulti/schemas/benchmark-campaign.schema.json",
+  "schema_version": "1.0.0",
+  "id": "dbscanmulti-core-v1",
+  "phase": "core",
+  "purpose": "Medir separadamente ganho Multi-minPts, Multi-EPS, Multi-Both, comparação com cuML, efeito de densidade, escala em N e escala em D após aprovação do PILOT.",
+  "baseline_validation": {
+    "source_revision": "02a77d03e738d23392f14a294e9ae208028e8e12",
+    "job_id": 4996,
+    "validation_approved": true
+  },
+  "protocol": {
+    "backend": "cuvs",
+    "index": "int32",
+    "neigh_per_row": 0,
+    "max_mbytes_per_batch": 56000,
+    "warmup": 1,
+    "measured_samples": 10,
+    "block_design": "symmetric",
+    "eps_quantiles": [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8],
+    "minpts_pool_size": 8,
+    "minpts_pool_method": "geometric-rounded-deduplicated-filled-v1",
+    "seed": 42,
+    "dataset_protocol": "knn-sample-rank-v2",
+    "methods": ["multi", "experimental_sequential", "cuml_sequential"],
+    "timing_boundary": "device-resident-input-to-device-labels"
+  },
+  "cases": [
+    {
+      "id": "ref_scalar_eps_i0",
+      "dataset": "moons_16d",
+      "n": 100000,
+      "eps_indices": [0],
+      "minpts_indices": [3],
+      "routes": ["auto"],
+      "tags": ["scalar", "reference", "eps-scaling"]
+    },
+    {
+      "id": "ref_scalar_eps_i3",
+      "dataset": "moons_16d",
+      "n": 100000,
+      "eps_indices": [3],
+      "minpts_indices": [3],
+      "routes": ["auto"],
+      "tags": ["scalar", "reference", "eps-scaling"]
+    },
+    {
+      "id": "ref_scalar_eps_i7",
+      "dataset": "moons_16d",
+      "n": 100000,
+      "eps_indices": [7],
+      "minpts_indices": [3],
+      "routes": ["auto"],
+      "tags": ["scalar", "reference", "eps-scaling"]
+    },
+    {
+      "id": "ref_multi_minpts_l2",
+      "dataset": "moons_16d",
+      "n": 100000,
+      "eps_indices": [3],
+      "minpts_indices": [0, 7],
+      "routes": ["auto"],
+      "tags": ["multi-minpts", "reference", "minpts-scaling"]
+    },
+    {
+      "id": "ref_multi_minpts_l4",
+      "dataset": "moons_16d",
+      "n": 100000,
+      "eps_indices": [3],
+      "minpts_indices": [0, 2, 4, 7],
+      "routes": ["auto"],
+      "tags": ["multi-minpts", "reference", "minpts-scaling"]
+    },
+    {
+      "id": "ref_multi_minpts_l8",
+      "dataset": "moons_16d",
+      "n": 100000,
+      "eps_indices": [3],
+      "minpts_indices": [0, 1, 2, 3, 4, 5, 6, 7],
+      "routes": ["auto"],
+      "tags": ["multi-minpts", "reference", "minpts-scaling"]
+    },
+    {
+      "id": "ref_multi_eps_k2",
+      "dataset": "moons_16d",
+      "n": 100000,
+      "eps_indices": [1, 6],
+      "minpts_indices": [3],
+      "routes": ["annotated", "dense", "auto"],
+      "tags": ["multi-eps", "reference", "eps-scaling", "route-comparison"]
+    },
+    {
+      "id": "ref_multi_eps_k4",
+      "dataset": "moons_16d",
+      "n": 100000,
+      "eps_indices": [0, 2, 5, 7],
+      "minpts_indices": [3],
+      "routes": ["annotated", "dense", "auto"],
+      "tags": ["multi-eps", "reference", "eps-scaling", "route-comparison"]
+    },
+    {
+      "id": "ref_multi_eps_k8",
+      "dataset": "moons_16d",
+      "n": 100000,
+      "eps_indices": [0, 1, 2, 3, 4, 5, 6, 7],
+      "minpts_indices": [3],
+      "routes": ["annotated", "dense", "auto"],
+      "tags": ["multi-eps", "reference", "eps-scaling", "route-comparison"]
+    },
+    {
+      "id": "ref_multi_both_2x2",
+      "dataset": "moons_16d",
+      "n": 100000,
+      "eps_indices": [1, 6],
+      "minpts_indices": [0, 7],
+      "routes": ["annotated", "dense", "auto"],
+      "tags": ["multi-both", "reference", "grid-scaling", "route-comparison"]
+    },
+    {
+      "id": "ref_multi_both_2x4",
+      "dataset": "moons_16d",
+      "n": 100000,
+      "eps_indices": [1, 6],
+      "minpts_indices": [0, 2, 4, 7],
+      "routes": ["annotated", "dense", "auto"],
+      "tags": ["multi-both", "reference", "grid-scaling", "route-comparison"]
+    },
+    {
+      "id": "ref_multi_both_4x2",
+      "dataset": "moons_16d",
+      "n": 100000,
+      "eps_indices": [0, 2, 5, 7],
+      "minpts_indices": [0, 7],
+      "routes": ["annotated", "dense", "auto"],
+      "tags": ["multi-both", "reference", "grid-scaling", "route-comparison"]
+    },
+    {
+      "id": "ref_multi_both_4x4",
+      "dataset": "moons_16d",
+      "n": 100000,
+      "eps_indices": [0, 2, 5, 7],
+      "minpts_indices": [0, 2, 4, 7],
+      "routes": ["annotated", "dense", "auto"],
+      "tags": ["multi-both", "reference", "grid-scaling", "route-comparison"]
+    },
+    {
+      "id": "ref_multi_both_4x8",
+      "dataset": "moons_16d",
+      "n": 100000,
+      "eps_indices": [0, 2, 5, 7],
+      "minpts_indices": [0, 1, 2, 3, 4, 5, 6, 7],
+      "routes": ["annotated", "dense", "auto"],
+      "tags": ["multi-both", "reference", "grid-scaling", "route-comparison"]
+    },
+    {
+      "id": "ref_multi_both_8x4",
+      "dataset": "moons_16d",
+      "n": 100000,
+      "eps_indices": [0, 1, 2, 3, 4, 5, 6, 7],
+      "minpts_indices": [0, 2, 4, 7],
+      "routes": ["annotated", "dense", "auto"],
+      "tags": ["multi-both", "reference", "grid-scaling", "route-comparison"]
+    },
+    {
+      "id": "index64_multi_minpts_l4",
+      "dataset": "moons_16d",
+      "n": 100000,
+      "index": "int64",
+      "eps_indices": [3],
+      "minpts_indices": [0, 2, 4, 7],
+      "routes": ["auto"],
+      "tags": ["multi-minpts", "reference", "index-overhead"]
+    },
+    {
+      "id": "index64_multi_both_2x4_auto",
+      "dataset": "moons_16d",
+      "n": 100000,
+      "index": "int64",
+      "eps_indices": [1, 6],
+      "minpts_indices": [0, 2, 4, 7],
+      "routes": ["auto"],
+      "tags": ["multi-both", "reference", "index-overhead"]
+    },
+    {
+      "id": "density_filaments_multi_eps_k4",
+      "dataset": "filaments_16d",
+      "n": 64000,
+      "eps_indices": [0, 1, 2, 3],
+      "minpts_indices": [3],
+      "routes": ["annotated", "dense", "auto"],
+      "tags": ["multi-eps", "density", "sparse", "route-comparison"]
+    },
+    {
+      "id": "density_filaments_multi_both_2x4",
+      "dataset": "filaments_16d",
+      "n": 64000,
+      "eps_indices": [1, 6],
+      "minpts_indices": [0, 2, 4, 7],
+      "routes": ["annotated", "dense", "auto"],
+      "tags": ["multi-both", "density", "sparse", "route-comparison"]
+    },
+    {
+      "id": "density_dense_blobs_multi_eps_k4",
+      "dataset": "dense_blobs_16d",
+      "n": 64000,
+      "eps_indices": [4, 5, 6, 7],
+      "minpts_indices": [3],
+      "routes": ["annotated", "dense", "auto"],
+      "tags": ["multi-eps", "density", "dense", "route-comparison"]
+    },
+    {
+      "id": "density_dense_blobs_multi_both_2x4",
+      "dataset": "dense_blobs_16d",
+      "n": 64000,
+      "eps_indices": [1, 6],
+      "minpts_indices": [0, 2, 4, 7],
+      "routes": ["annotated", "dense", "auto"],
+      "tags": ["multi-both", "density", "dense", "route-comparison"]
+    },
+    {
+      "id": "density_uniform_multi_eps_k4",
+      "dataset": "uniform_64d",
+      "n": 64000,
+      "tier": "stress",
+      "eps_indices": [2, 3, 4, 5],
+      "minpts_indices": [3],
+      "routes": ["annotated", "dense", "auto"],
+      "tags": ["multi-eps", "density", "intermediate", "route-comparison"]
+    },
+    {
+      "id": "density_uniform_multi_both_2x4",
+      "dataset": "uniform_64d",
+      "n": 64000,
+      "tier": "stress",
+      "eps_indices": [1, 6],
+      "minpts_indices": [0, 2, 4, 7],
+      "routes": ["annotated", "dense", "auto"],
+      "tags": ["multi-both", "density", "intermediate", "route-comparison"]
+    },
+    {
+      "id": "nscale_moons_n64000_multi_minpts_l4",
+      "dataset": "moons_16d",
+      "n": 64000,
+      "eps_indices": [3],
+      "minpts_indices": [0, 2, 4, 7],
+      "routes": ["auto"],
+      "tags": ["multi-minpts", "n-scale", "minpts-scaling"]
+    },
+    {
+      "id": "nscale_moons_n64000_multi_eps_k4",
+      "dataset": "moons_16d",
+      "n": 64000,
+      "eps_indices": [0, 2, 5, 7],
+      "minpts_indices": [3],
+      "routes": ["annotated", "dense", "auto"],
+      "tags": ["multi-eps", "n-scale", "eps-scaling", "route-comparison"]
+    },
+    {
+      "id": "nscale_moons_n64000_multi_both_2x4",
+      "dataset": "moons_16d",
+      "n": 64000,
+      "eps_indices": [1, 6],
+      "minpts_indices": [0, 2, 4, 7],
+      "routes": ["annotated", "dense", "auto"],
+      "tags": ["multi-both", "n-scale", "grid-scaling", "route-comparison"]
+    },
+    {
+      "id": "nscale_moons_n200000_multi_minpts_l4",
+      "dataset": "moons_16d",
+      "n": 200000,
+      "tier": "stress",
+      "eps_indices": [3],
+      "minpts_indices": [0, 2, 4, 7],
+      "routes": ["auto"],
+      "tags": ["multi-minpts", "n-scale", "minpts-scaling"]
+    },
+    {
+      "id": "nscale_moons_n200000_multi_eps_k4",
+      "dataset": "moons_16d",
+      "n": 200000,
+      "tier": "stress",
+      "eps_indices": [0, 2, 5, 7],
+      "minpts_indices": [3],
+      "routes": ["annotated", "dense", "auto"],
+      "tags": ["multi-eps", "n-scale", "eps-scaling", "route-comparison"]
+    },
+    {
+      "id": "nscale_moons_n200000_multi_both_2x4",
+      "dataset": "moons_16d",
+      "n": 200000,
+      "tier": "stress",
+      "eps_indices": [1, 6],
+      "minpts_indices": [0, 2, 4, 7],
+      "routes": ["annotated", "dense", "auto"],
+      "tags": ["multi-both", "n-scale", "grid-scaling", "route-comparison"]
+    },
+    {
+      "id": "dscale_dense_blobs_2d_multi_eps_k4",
+      "dataset": "dense_blobs_2d",
+      "n": 64000,
+      "eps_indices": [0, 2, 5, 7],
+      "minpts_indices": [3],
+      "routes": ["annotated", "dense", "auto"],
+      "tags": ["multi-eps", "d-scale", "eps-scaling", "route-comparison"]
+    },
+    {
+      "id": "dscale_dense_blobs_2d_multi_both_2x4",
+      "dataset": "dense_blobs_2d",
+      "n": 64000,
+      "eps_indices": [1, 6],
+      "minpts_indices": [0, 2, 4, 7],
+      "routes": ["annotated", "dense", "auto"],
+      "tags": ["multi-both", "d-scale", "grid-scaling", "route-comparison"]
+    },
+    {
+      "id": "dscale_dense_blobs_32d_multi_eps_k4",
+      "dataset": "dense_blobs_32d",
+      "n": 64000,
+      "eps_indices": [0, 2, 5, 7],
+      "minpts_indices": [3],
+      "routes": ["annotated", "dense", "auto"],
+      "tags": ["multi-eps", "d-scale", "eps-scaling", "route-comparison"]
+    },
+    {
+      "id": "dscale_dense_blobs_32d_multi_both_2x4",
+      "dataset": "dense_blobs_32d",
+      "n": 64000,
+      "eps_indices": [1, 6],
+      "minpts_indices": [0, 2, 4, 7],
+      "routes": ["annotated", "dense", "auto"],
+      "tags": ["multi-both", "d-scale", "grid-scaling", "route-comparison"]
+    },
+    {
+      "id": "dscale_dense_blobs_64d_multi_eps_k4",
+      "dataset": "dense_blobs_64d",
+      "n": 64000,
+      "tier": "stress",
+      "eps_indices": [0, 2, 5, 7],
+      "minpts_indices": [3],
+      "routes": ["annotated", "dense", "auto"],
+      "tags": ["multi-eps", "d-scale", "eps-scaling", "route-comparison"]
+    },
+    {
+      "id": "dscale_dense_blobs_64d_multi_both_2x4",
+      "dataset": "dense_blobs_64d",
+      "n": 64000,
+      "tier": "stress",
+      "eps_indices": [1, 6],
+      "minpts_indices": [0, 2, 4, 7],
+      "routes": ["annotated", "dense", "auto"],
+      "tags": ["multi-both", "d-scale", "grid-scaling", "route-comparison"]
+    }
+  ]
+}

@@ -1,0 +1,324 @@
+#!/bin/bash
+#SBATCH --job-name=dbscanmulti_pilot
+#SBATCH --partition=scientific
+#SBATCH --qos=scientific-qos
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=64G
+#SBATCH --gres=gpu:1
+#SBATCH --time=02:00:00
+#SBATCH --output=job_%j.out
+#SBATCH --error=job_%j.err
+
+# PILOT cientifico. Antes de submeter:
+#   1. prepare os datasets no no de login com `benchmark_campaign.py prepare`;
+#   2. crie CAMPAIGN_DIR e CAMPAIGN_DIR/logs;
+#   3. informe EXPECTED_SOURCE_TREE_HASH calculado na arvore que sera sincronizada;
+#   4. gere e revise requirements.lock.txt no ambiente do cluster.
+#
+# Este job nunca gera datasets e nao inicia a campanha CORE.
+
+set -euo pipefail
+
+echo "SLURM_JOB_ID: ${SLURM_JOB_ID:-unset}"
+echo "SLURM_NODELIST: ${SLURM_NODELIST:-unset}"
+echo "CUDA_VISIBLE_DEVICES: ${CUDA_VISIBLE_DEVICES:-unset}"
+echo "hostname: $(hostname)"
+echo "date: $(date --iso-8601=seconds)"
+
+module --force purge
+module load GCCcore/12.2.0
+module load CUDA/12.6.0
+export PYTHONNOUSERSITE=1
+export OPENBLAS_NUM_THREADS="${SLURM_CPUS_PER_TASK:-8}"
+export OMP_NUM_THREADS="${SLURM_CPUS_PER_TASK:-8}"
+export MKL_NUM_THREADS="${SLURM_CPUS_PER_TASK:-8}"
+
+PROJECT_ROOT="${SLURM_SUBMIT_DIR:-$(pwd)}"
+cd "$PROJECT_ROOT"
+[ -f Makefile ] || { echo "erro: Makefile ausente em $PROJECT_ROOT" >&2; exit 2; }
+
+# shellcheck disable=SC1091
+source scripts/setup_job_tmp.sh
+
+VENV_DIR="${VENV_DIR:-.venv}"
+[ -f "$VENV_DIR/bin/activate" ] || {
+  echo "erro: venv nao encontrado em '$VENV_DIR'" >&2
+  exit 2
+}
+# shellcheck disable=SC1090
+source "$VENV_DIR/bin/activate"
+python -c 'import cupy; from cuml.cluster import DBSCAN' 2>/dev/null || {
+  echo "erro: CuPy/cuML ausentes no venv ativo" >&2
+  exit 2
+}
+
+PILOT_SPEC="${PILOT_SPEC:-$PROJECT_ROOT/scripts/campaigns/pilot.json}"
+LOCKFILE="${LOCKFILE:-$PROJECT_ROOT/requirements.lock.txt}"
+# Diretorio novo e exclusivo desta campanha. O validador tambem recusa qualquer
+# dataset antigo com quantis, gerador ou hashes incompativeis.
+DBM_BASE="${DBM_BASE:-$HOME/dados/dbscanmulti/official-campaign-v1}"
+DATA_DIR="${DATA_DIR:-$DBM_BASE/data}"
+
+[ -n "${CAMPAIGN_DIR:-}" ] || {
+  echo "erro: defina CAMPAIGN_DIR e crie CAMPAIGN_DIR/logs antes do sbatch" >&2
+  exit 2
+}
+[ -n "${EXPECTED_SOURCE_TREE_HASH:-}" ] || {
+  echo "erro: defina EXPECTED_SOURCE_TREE_HASH com scripts/source_tree_hash.py" >&2
+  exit 2
+}
+[ -f "$PILOT_SPEC" ] || {
+  echo "erro: spec do PILOT ausente: $PILOT_SPEC" >&2
+  exit 2
+}
+[ -f "$LOCKFILE" ] || {
+  echo "erro: lockfile ausente: $LOCKFILE" >&2
+  echo "      gere e revise o lockfile no cluster antes do PILOT" >&2
+  exit 2
+}
+python - "$LOCKFILE" <<'PY'
+import subprocess
+import sys
+
+lockfile = sys.argv[1]
+expected = [line.rstrip() for line in open(lockfile, encoding="utf-8") if line.strip()]
+completed = subprocess.run(
+    [sys.executable, "-m", "pip", "freeze", "--all"],
+    text=True,
+    capture_output=True,
+    check=False,
+)
+if completed.returncode:
+    raise SystemExit("erro: pip freeze --all falhou:\n" + completed.stderr)
+observed = [line.rstrip() for line in completed.stdout.splitlines() if line.strip()]
+if observed != expected:
+    missing = sorted(set(expected) - set(observed))[:5]
+    extra = sorted(set(observed) - set(expected))[:5]
+    raise SystemExit(
+        "erro: ambiente diverge do lockfile; "
+        f"ausentes={missing!r} extras={extra!r}"
+    )
+print(f"lockfile: ambiente confere exatamente ({len(expected)} linhas)")
+PY
+[ -d "$DATA_DIR" ] || {
+  echo "erro: diretorio de datasets ausente: $DATA_DIR" >&2
+  echo "      execute benchmark_campaign.py prepare no no de login" >&2
+  exit 2
+}
+
+mkdir -p "$CAMPAIGN_DIR/logs" "$CAMPAIGN_DIR/validation"
+for output in manifest.json raw summaries environment.json; do
+  if [ -e "$CAMPAIGN_DIR/$output" ]; then
+    echo "erro: campanha nao esta vazia; ja existe $CAMPAIGN_DIR/$output" >&2
+    exit 2
+  fi
+done
+
+# O spec e a autoridade do protocolo. Esta checagem impede que um spec editado por engano
+# transforme este job em outra campanha mantendo o nome PILOT.
+python - "$PILOT_SPEC" <<'PY'
+import json
+import sys
+
+path = sys.argv[1]
+with open(path, encoding="utf-8") as stream:
+    spec = json.load(stream)
+
+expected = {
+    "backend": "cuvs",
+    "index": "int32",
+    "neigh_per_row": 0,
+    "max_mbytes_per_batch": 56000,
+    "warmup": 1,
+    "measured_samples": 2,
+    "block_design": "symmetric",
+}
+errors = []
+if str(spec.get("phase", "")).lower() != "pilot":
+    errors.append(f"phase={spec.get('phase')!r}, esperado 'pilot'")
+protocol = spec.get("protocol")
+if not isinstance(protocol, dict):
+    errors.append("protocol ausente ou nao e objeto")
+else:
+    for field, expected_value in expected.items():
+        if protocol.get(field) != expected_value:
+            errors.append(
+                f"protocol.{field}={protocol.get(field)!r}, esperado {expected_value!r}"
+            )
+if errors:
+    raise SystemExit("erro: spec incompatível com o PILOT oficial:\n- " + "\n- ".join(errors))
+print("spec PILOT: protocolo fixo validado")
+PY
+
+ACTUAL_SOURCE_TREE_HASH="$(python scripts/source_tree_hash.py)"
+if [ "$ACTUAL_SOURCE_TREE_HASH" != "$EXPECTED_SOURCE_TREE_HASH" ]; then
+  echo "erro: snapshot divergente" >&2
+  echo "  esperado: $EXPECTED_SOURCE_TREE_HASH" >&2
+  echo "  atual:    $ACTUAL_SOURCE_TREE_HASH" >&2
+  exit 2
+fi
+printf '%s\n' "$ACTUAL_SOURCE_TREE_HASH" > "$CAMPAIGN_DIR/source-tree-hash.txt"
+echo "source tree: $ACTUAL_SOURCE_TREE_HASH"
+
+# Consulta o dispositivo logico 0 pelo runtime CUDA. Nao usa a primeira linha global do
+# nvidia-smi, que pode corresponder a outra GPU do no.
+GPU_INFO="$CAMPAIGN_DIR/environment.json"
+GPU_INFO_TMP="$CAMPAIGN_DIR/.environment.json.tmp.${SLURM_JOB_ID:-local}"
+python scripts/query_cuda_device.py --pretty > "$GPU_INFO_TMP"
+python - "$GPU_INFO_TMP" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as stream:
+    gpu = json.load(stream)
+errors = []
+if gpu.get("visible_device_count") != 1:
+    errors.append(f"visible_device_count={gpu.get('visible_device_count')!r}, esperado 1")
+if gpu.get("name") != "NVIDIA A100-SXM4-80GB":
+    errors.append(f"GPU={gpu.get('name')!r}, esperada 'NVIDIA A100-SXM4-80GB'")
+if gpu.get("cuda_arch") != "sm_80":
+    errors.append(f"cuda_arch={gpu.get('cuda_arch')!r}, esperado 'sm_80'")
+if int(gpu.get("total_memory_mib") or 0) < 80000:
+    errors.append(f"VRAM={gpu.get('total_memory_mib')!r} MiB, esperados ao menos 80000")
+if int(gpu.get("free_memory_mib") or 0) < 56000:
+    errors.append(f"memoria livre={gpu.get('free_memory_mib')!r} MiB, budget fixo e 56000")
+if errors:
+    raise SystemExit("erro: GPU alocada incompativel com o PILOT:\n- " + "\n- ".join(errors))
+print(
+    "GPU alocada: "
+    f"{gpu['name']} uuid={gpu.get('uuid')} pci={gpu.get('pci_bus_id')} "
+    f"cc={gpu['compute_capability']} vram={gpu['total_memory_mib']} MiB"
+)
+PY
+mv -f "$GPU_INFO_TMP" "$GPU_INFO"
+
+export MAX_MBYTES_PER_BATCH=56000
+RESOLVED_BUDGET="$(bash scripts/resolve_memory_budget.sh)"
+[ "$RESOLVED_BUDGET" = 56000 ] || {
+  echo "erro: budget efetivo inesperado: $RESOLVED_BUDGET MB" >&2
+  exit 2
+}
+echo "budget fixo: $RESOLVED_BUDGET MB"
+
+# Planejamento e datasets sao validados antes de gastar tempo compilando. O subcomando
+# validate-inputs apenas le; ele nunca substitui o prepare executado no no de login.
+PLAN_TMP="$CAMPAIGN_DIR/.plan.json.tmp.${SLURM_JOB_ID:-local}"
+python tools/benchmark_campaign.py plan --spec "$PILOT_SPEC" > "$PLAN_TMP"
+mv -f "$PLAN_TMP" "$CAMPAIGN_DIR/plan.json"
+python tools/benchmark_campaign.py validate-inputs \
+  --spec "$PILOT_SPEC" --data-dir "$DATA_DIR" \
+  > "$CAMPAIGN_DIR/validation/inputs.log"
+
+CUDA_ARCH=sm_80
+BUILD_DIR="$CAMPAIGN_DIR/build"
+COMMON_BUILD_ARGS=(BUILD_DIR="$BUILD_DIR" CUDA_ARCH="$CUDA_ARCH" STD=c++17 LINK_RAFT=1
+                   NVCCFLAGS=-O3 SOURCE_REVISION="$ACTUAL_SOURCE_TREE_HASH")
+if [ -n "${RAPIDS_INCLUDE:-}" ]; then COMMON_BUILD_ARGS+=(RAPIDS_INCLUDE="$RAPIDS_INCLUDE"); fi
+if [ -n "${CCCL_INCLUDE:-}" ]; then COMMON_BUILD_ARGS+=(CCCL_INCLUDE="$CCCL_INCLUDE"); fi
+CUVS_ARGS=("${COMMON_BUILD_ARGS[@]}" BACKEND=cuvs)
+CODES_ARGS=("${COMMON_BUILD_ARGS[@]}" BACKEND=codes)
+
+echo "--- build cuVS / sm_80 ---"
+make "${CUVS_ARGS[@]}"
+CUVS_BIN="$(make --no-print-directory -s print-target "${CUVS_ARGS[@]}")"
+echo "--- build codes / sm_80 ---"
+make "${CODES_ARGS[@]}"
+CODES_BIN="$(make --no-print-directory -s print-target "${CODES_ARGS[@]}")"
+
+identity() {
+  local backend="$1" binary="$2" output="$3" tmp
+  tmp="${output}.tmp.${SLURM_JOB_ID:-local}"
+  python scripts/check_binary_identity.py --binary "$binary" \
+    --backend "$backend" --cuda-arch "$CUDA_ARCH" --require-identified > "$tmp"
+  python - "$tmp" "$ACTUAL_SOURCE_TREE_HASH" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as stream:
+    identity = json.load(stream)
+observed = (identity.get("build") or {}).get("git_sha")
+if observed != sys.argv[2]:
+    raise SystemExit(f"erro: binario registra snapshot {observed!r}; esperado {sys.argv[2]!r}")
+PY
+  mv -f "$tmp" "$output"
+}
+
+identity cuvs "$CUVS_BIN" "$CAMPAIGN_DIR/validation/identity-cuvs.json"
+identity codes "$CODES_BIN" "$CAMPAIGN_DIR/validation/identity-codes.json"
+
+echo "--- selftest cuVS ---"
+make selftest "${CUVS_ARGS[@]}" 2>&1 | tee "$CAMPAIGN_DIR/validation/selftest-cuvs.log"
+echo "--- selftest codes ---"
+make selftest "${CODES_ARGS[@]}" 2>&1 | tee "$CAMPAIGN_DIR/validation/selftest-codes.log"
+
+echo "--- gate semantico ---"
+MATRIX_JSON="$CAMPAIGN_DIR/validation/matrix.json"
+MATRIX_STDOUT="$CAMPAIGN_DIR/validation/matrix.stdout.jsonl"
+MATRIX_STDERR="$CAMPAIGN_DIR/validation/matrix.stderr.log"
+set +e
+python tools/run_validation_matrix.py \
+  --binary "$CUVS_BIN" \
+  --random-seeds 3 \
+  --repetitions 2 \
+  --falhas-dir "$CAMPAIGN_DIR/validation/failures" \
+  --out "$MATRIX_JSON" \
+  > "$MATRIX_STDOUT" 2> "$MATRIX_STDERR"
+MATRIX_STATUS=$?
+set -e
+cat "$MATRIX_STDOUT"
+if [ -s "$MATRIX_STDERR" ]; then cat "$MATRIX_STDERR" >&2; fi
+if [ "$MATRIX_STATUS" -ne 0 ]; then
+  echo "erro: gate semantico retornou $MATRIX_STATUS" >&2
+  exit "$MATRIX_STATUS"
+fi
+python - "$MATRIX_JSON" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as stream:
+    result = json.load(stream)
+if result.get("validation_approved") is not True:
+    raise SystemExit("erro: validation_approved nao e true; PILOT bloqueado")
+print("gate semantico: validation_approved=true")
+PY
+
+echo "--- campanha PILOT ---"
+HARNESS_STDOUT="$CAMPAIGN_DIR/logs/benchmark.stdout.log"
+HARNESS_STDERR="$CAMPAIGN_DIR/logs/benchmark.stderr.log"
+set +e
+python tools/benchmark_campaign.py run \
+  --spec "$PILOT_SPEC" \
+  --binary "$CUVS_BIN" \
+  --data-dir "$DATA_DIR" \
+  --campaign-dir "$CAMPAIGN_DIR" \
+  --gpu-info "$GPU_INFO" \
+  --validation-matrix "$MATRIX_JSON" \
+  --lockfile "$LOCKFILE" \
+  > "$HARNESS_STDOUT" 2> "$HARNESS_STDERR"
+HARNESS_STATUS=$?
+set -e
+FINALIZE_STATUS=0
+if [ -f "$CAMPAIGN_DIR/manifest.json" ]; then
+  set +e
+  python tools/benchmark_campaign.py finalize-logs \
+    --campaign-dir "$CAMPAIGN_DIR" \
+    --stdout-log "$HARNESS_STDOUT" \
+    --stderr-log "$HARNESS_STDERR"
+  FINALIZE_STATUS=$?
+  set -e
+fi
+cat "$HARNESS_STDOUT"
+if [ -s "$HARNESS_STDERR" ]; then cat "$HARNESS_STDERR" >&2; fi
+if [ "$HARNESS_STATUS" -ne 0 ]; then
+  echo "erro: campanha PILOT retornou $HARNESS_STATUS; artefatos preservados em $CAMPAIGN_DIR" >&2
+  exit "$HARNESS_STATUS"
+fi
+if [ "$FINALIZE_STATUS" -ne 0 ]; then
+  echo "erro: nao foi possivel anexar hashes dos logs ao manifesto" >&2
+  exit "$FINALIZE_STATUS"
+fi
+
+echo "PILOT finalizado: $CAMPAIGN_DIR"
+echo "date: $(date --iso-8601=seconds)"

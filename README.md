@@ -308,8 +308,10 @@ BIN="$(make -s print-target CUDA_ARCH=sm_80 LINK_RAFT=1)"
   `min_samples` e `config_order` do JSON;
 - no máximo 16 valores de ε por execução;
 - a última linha do stdout é o JSON com `fit_ms` e `configuration_count`;
-- `fit_ms` cobre a execução do algoritmo, incluindo a alocação do workspace, e exclui
-  leitura de arquivo e as transferências de entrada e saída;
+- `fit_ms` cobre a execução do algoritmo e qualquer crescimento do workspace que ainda
+  ocorra naquela chamada, e exclui leitura de arquivo e as transferências de entrada e
+  saída; no protocolo oficial, o workspace externo cresce no *warmup* descartado e é
+  reaproveitado na amostra medida;
 - `--repeat R` mede R execuções e reporta a mediana em `fit_ms` (todas em `fit_ms_all`);
   `--warmup W` descarta as W primeiras. O bloco `execution` descreve somente a última
   repetição medida (`stats_scope="last_measured_repeat"`), não a agregação das R repetições;
@@ -317,7 +319,148 @@ BIN="$(make -s print-target CUDA_ARCH=sm_80 LINK_RAFT=1)"
   carregamento do módulo CUDA, que não é custo do algoritmo — sem `--warmup 1` a medição
   fica inflada.
 
+## Campanha oficial PILOT/CORE
+
+Os jobs `bench.slm`, `bench_variantes.slm`, `bench_escala.slm` e o uso direto de
+`bench_vs_cuml.py` permanecem úteis para diagnóstico, mas são **protocolos preliminares**.
+A campanha citável é definida pelos specs imutáveis
+[PILOT](scripts/campaigns/pilot.json) e [CORE](scripts/campaigns/core.json), pelos schemas
+em [schemas/](schemas/) e pelo *harness* [benchmark_campaign.py](tools/benchmark_campaign.py).
+O PILOT tem sete casos e duas amostras medidas por método: verifica o fluxo completo em
+regimes esparso, intermediário e denso, com casos escalar, Multi-minPts, Multi-EPS e
+Multi-Both. Duas amostras servem para validar estrutura, semântica, memória e duração;
+**não sustentam conclusão de desempenho**. A CORE amplia a grade e usa dez amostras por
+método, mas não deve ser executada antes de o manifesto do PILOT estar completo, sem
+falhas e revisado. O *harness* também bloqueia uma spec `phase=core` sem liberação explícita;
+essa liberação não substitui a revisão do PILOT.
+
+O protocolo oficial fixa A100-SXM4-80GB, backend cuVS, `int32`, `neigh_per_row=0`, orçamento
+de 56.000 MB decimais (56.000.000.000 bytes), um *warmup* descartado e blocos simétricos: a ordem dos métodos é rotacionada
+entre casos e cada bloco direto é seguido pela ordem inversa. Cada método roda em processo
+isolado, evitando manter ao mesmo tempo os contextos CUDA do binário e do Python/cuML. As
+rotas `annotated` e `dense` são diagnósticos forçados; `auto` é a política adaptativa que
+representa o uso normal.
+
+Cada amostra/metodo tem timeout fixo de 900 s. Timeout vira falha preservada do caso; os
+demais casos continuam, e uma campanha parcial nunca libera a CORE.
+
+Cada bloco `forward` e o bloco `reverse` seguinte compartilham o mesmo `pair_index` e
+formam um par simetrico. A inversao da ordem reduz o vies temporal; os dois blocos nao sao
+tratados como duas unidades inferenciais independentes.
+
+A CORE planejada tem 35 casos, 1.550 registros medidos e dez amostras por metodo. Dois
+casos `auto` isolam o custo de `int64`, sem multiplicar a matriz principal; sete casos
+N=200k/D=64 usam `tier=stress` e nao entram na inferencia CORE primaria. A execucao CORE
+exige simultaneamente `--allow-core` e `--pilot-manifest`; o manifesto precisa ser o PILOT
+oficial completo e pertencer ao mesmo SHA-256 da arvore.
+
+Esses 35 casos representam 5.790 fits DBSCAN medidos e outros 5.790 fits de warmup:
+11.580 fits no total. O protocolo continua `int32`; somente
+`index64_multi_minpts_l4` e `index64_multi_both_2x4_auto` usam o override `int64`, como
+diagnostico separado de custo de indice. Eles nao alteram a inferencia principal `int32`.
+
+### Fronteira de tempo e métricas
+
+A medida oficial é `fit_ms`, com fronteira
+`device-resident-input-to-device-labels`: começa com os pontos já na GPU e termina quando
+os rótulos de dispositivo estão prontos. Ficam fora dela geração/leitura do dataset,
+criação do processo, H2D e D2H; `setup_ms`, `h2d_ms`, `d2h_ms` e `end_to_end_ms` são apenas
+diagnósticos. O *warmup* descarta o carregamento inicial; no binário experimental, também
+absorve o crescimento inicial do workspace que será reaproveitado na amostra medida.
+Os tempos experimental e cuML usam eventos CUDA, uma configuração de cada vez nos sweeps
+escalares, e o tempo do sweep é a soma dessas configurações.
+
+As razoes positivas sao calculadas dentro de cada bloco. Para cada metrica e rota, o valor
+do par e a media geometrica dos dois sentidos:
+`ratio_pair = sqrt(ratio_forward * ratio_reverse)`. A agregacao usa `pair_index`, nunca o
+bloco isolado, como unidade inferencial.
+
+- `ganho_multi_puro(route) = experimental_sequential.fit_ms / multi(route).fit_ms`;
+- `speedup_vs_cuml(route) = cuml_sequential.fit_ms / multi(route).fit_ms`, comparação entre
+  implementações/APIs, não um ganho algorítmico puro;
+- `annotated_vs_dense = multi(dense).fit_ms / multi(annotated).fit_ms`; valor maior que 1
+  favorece a rota anotada;
+- `auto_efficiency = min(multi(annotated), multi(dense)) / multi(auto)`; valor próximo de 1
+  indica que a decisão automática ficou próxima da melhor rota forçada;
+- `efficiency_per_configuration = ganho_multi_puro / (k*l)`, métrica auxiliar do ganho por
+  configuração, não substituta do ganho total.
+
+`best_forced` escolhe a menor latencia entre `annotated` e `dense` depois de observar as
+duas rotas. Por isso e um diagnostico pos-selecao potencialmente otimista; nunca e a
+inferencia principal. A politica principal continua sendo `auto`.
+
+O estimador oficial e a mediana dos valores por par. Media, desvio-padrao, minimo, maximo,
+P25, P75 e IQR tambem sao calculados sobre esses valores, sem remover outliers. O IC95%
+usa percentile bootstrap deterministico da mediana, com 10.000 reamostragens de pares.
+O PILOT possui um unico par e e estruturalmente nao conclusivo. A CORE possui cinco pares
+por metodo/caso; casos diferentes nunca sao agrupados para inflar `n`.
+
+### Preparação e submissão do PILOT
+
+No nó de login, depois de sincronizar a árvore final e ativar o ambiente travado:
+
+```bash
+cd ~/cuML-DBSCANMulti
+source .venv/bin/activate
+export DBM_BASE="$HOME/dados/dbscanmulti/official-campaign-v1"
+
+python tools/benchmark_campaign.py plan \
+  --spec scripts/campaigns/pilot.json
+python tools/benchmark_campaign.py prepare \
+  --spec scripts/campaigns/pilot.json \
+  --data-dir "$DBM_BASE/data"
+
+# Se setup_env.sh ainda nao o gerou, congele e revise este ambiente uma vez:
+test -s requirements.lock.txt || python -m pip freeze --all > requirements.lock.txt
+python -m pip freeze --all | diff -u requirements.lock.txt -
+export LOCKFILE="$PWD/requirements.lock.txt"
+export CAMPAIGN_DIR="$DBM_BASE/results/pilot-$(date -u +%Y%m%dT%H%M%SZ)"
+mkdir -p "$CAMPAIGN_DIR/logs"
+export EXPECTED_SOURCE_TREE_HASH="$(python scripts/source_tree_hash.py)"
+
+# Primeiro revalide o novo snapshot. Aguarde e confira job_<id>.out/.err.
+sbatch scripts/check_gpu.slm
+
+# Somente depois do novo check_gpu integralmente aprovado:
+sbatch --export=ALL \
+  --output="$CAMPAIGN_DIR/logs/job_%j.out" \
+  --error="$CAMPAIGN_DIR/logs/job_%j.err" \
+  scripts/bench_pilot.slm
+```
+
+`official-campaign-v1` e um diretorio novo, separado dos datasets historicos de tres
+quantis. O comando `prepare` recusa qualquer arquivo cujo protocolo, grade, gerador ou
+SHA-256 nao corresponda ao spec oficial; ele nunca reaproveita silenciosamente esses dados.
+
+`prepare` publica datasets atomicamente e recusa metadados/hashes incompatíveis com
+`knn-sample-rank-v2`; o job não gera datasets. `requirements.lock.txt` precisa existir,
+estar revisado e coincidir exatamente com o ambiente, e seu SHA-256 entra nos artefatos.
+Se o venv não for `.venv`, exporte `VENV_DIR` antes do `sbatch`.
+
+O job 4996 validou semanticamente a revisão `02a77d03e738d23392f14a294e9ae208028e8e12`.
+Como a instrumentação da campanha muda o hash da árvore, essa evidência não é reutilizada
+silenciosamente: `bench_pilot.slm` exige `EXPECTED_SOURCE_TREE_HASH`, grava o mesmo hash no
+build, confere a identidade dos binários, roda os dois selftests e uma nova matriz semântica
+antes do benchmark. Qualquer nova mudança em `src/`, `tools/`, `scripts/`, `schemas/`, no
+Makefile ou nos requisitos exige recalcular o hash e repetir esse gate. Planejar a CORE é
+seguro e não usa GPU:
+
+```bash
+python tools/benchmark_campaign.py plan --spec scripts/campaigns/core.json
+```
+
+Mesmo depois de um PILOT aprovado, uma futura execucao CORE deve fornecer os dois flags
+`--allow-core --pilot-manifest "$PILOT_CAMPAIGN_DIR/manifest.json"`. O harness verifica
+`phase=pilot`, `status=completed`, ausencia de falhas, gate semantico, contagens completas,
+hashes dos artefatos referenciados e igualdade do `source_tree_sha256` completo.
+
+Não há submissão CORE autorizada nesta etapa. A organização dos artefatos e o critério de
+promoção estão em [results/README.md](results/README.md).
+
 ## Comparação com o cuML
+
+Os comandos desta seção pertencem ao protocolo histórico/preliminar. Para uma medição
+oficial, use o PILOT acima e somente depois promova a campanha CORE.
 
 ```bash
 sbatch scripts/bench.slm                                   # moons_16d, N=100k
@@ -530,8 +673,8 @@ Não rode o teste de GPU no nó de *login*.
 | [src/multi/](src/multi/) | Runner multiparamétrico, *core points* multi-*minPts*, o invólucro do cuVS e a anotação/filtro do CSR por ε |
 | [src/compat/](src/compat/) | *Shim* de cabeçalho do cuML que só existe no build do CMake deles |
 | [src/main.cu](src/main.cu) | Executável de linha de comando |
-| [scripts/](scripts/) | Jobs Slurm: `check_gpu.slm` (sanidade), `bench.slm` (comparação) |
-| [tools/](tools/) | Geração de datasets, benchmark, matriz de correção e oráculo DBSCAN offline |
+| [scripts/](scripts/) | Jobs Slurm: `check_gpu.slm` (sanidade), `bench_pilot.slm` (campanha oficial) e jobs históricos/preliminares |
+| [tools/](tools/) | Geração de datasets, campanha de benchmark, matriz de correção e oráculo DBSCAN offline |
 | [docs/fontes-primarias.md](docs/fontes-primarias.md) | Fontes, versões fixadas, pontos de modificação, licenças e pendências |
 | [docs/reprodutibilidade.md](docs/reprodutibilidade.md) | Critério de aceite, metadados e limites das alegações experimentais |
 | [docs/prontidao-publicacao.md](docs/prontidao-publicacao.md) | Checklist P0/P1/P2 e alegações atualmente sustentadas |

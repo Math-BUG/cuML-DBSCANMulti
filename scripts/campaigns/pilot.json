@@ -1,0 +1,93 @@
+{
+  "$schema": "https://github.com/Math-BUG/cuML-DBSCANMulti/schemas/benchmark-campaign.schema.json",
+  "schema_version": "1.0.0",
+  "id": "dbscanmulti-pilot-v1",
+  "phase": "pilot",
+  "purpose": "Validar o harness, os contratos raw e a viabilidade de memória antes da campanha CORE, cobrindo paridade escalar, Multi-minPts, Multi-EPS esparso/denso e Multi-Both.",
+  "baseline_validation": {
+    "source_revision": "02a77d03e738d23392f14a294e9ae208028e8e12",
+    "job_id": 4996,
+    "validation_approved": true
+  },
+  "protocol": {
+    "backend": "cuvs",
+    "index": "int32",
+    "neigh_per_row": 0,
+    "max_mbytes_per_batch": 56000,
+    "warmup": 1,
+    "measured_samples": 2,
+    "block_design": "symmetric",
+    "eps_quantiles": [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8],
+    "minpts_pool_size": 8,
+    "minpts_pool_method": "geometric-rounded-deduplicated-filled-v1",
+    "seed": 42,
+    "dataset_protocol": "knn-sample-rank-v2",
+    "methods": ["multi", "experimental_sequential", "cuml_sequential"],
+    "timing_boundary": "device-resident-input-to-device-labels"
+  },
+  "cases": [
+    {
+      "id": "scalar_sparse",
+      "dataset": "filaments_16d",
+      "n": 64000,
+      "eps_indices": [0],
+      "minpts_indices": [3],
+      "routes": ["auto"],
+      "tags": ["scalar", "pilot", "sparse"]
+    },
+    {
+      "id": "scalar_intermediate",
+      "dataset": "moons_16d",
+      "n": 64000,
+      "eps_indices": [3],
+      "minpts_indices": [3],
+      "routes": ["auto"],
+      "tags": ["scalar", "pilot", "intermediate"]
+    },
+    {
+      "id": "scalar_dense",
+      "dataset": "dense_blobs_16d",
+      "n": 64000,
+      "eps_indices": [7],
+      "minpts_indices": [3],
+      "routes": ["auto"],
+      "tags": ["scalar", "pilot", "dense"]
+    },
+    {
+      "id": "multi_minpts_l4",
+      "dataset": "moons_16d",
+      "n": 64000,
+      "eps_indices": [3],
+      "minpts_indices": [0, 2, 4, 7],
+      "routes": ["auto"],
+      "tags": ["multi-minpts", "pilot", "intermediate"]
+    },
+    {
+      "id": "multi_eps_sparse_k4",
+      "dataset": "filaments_16d",
+      "n": 64000,
+      "eps_indices": [0, 1, 2, 3],
+      "minpts_indices": [3],
+      "routes": ["annotated", "dense", "auto"],
+      "tags": ["multi-eps", "pilot", "sparse", "route-comparison"]
+    },
+    {
+      "id": "multi_eps_dense_k4",
+      "dataset": "dense_blobs_16d",
+      "n": 64000,
+      "eps_indices": [4, 5, 6, 7],
+      "minpts_indices": [3],
+      "routes": ["annotated", "dense", "auto"],
+      "tags": ["multi-eps", "pilot", "dense", "route-comparison"]
+    },
+    {
+      "id": "multi_both_2x4",
+      "dataset": "moons_16d",
+      "n": 64000,
+      "eps_indices": [1, 6],
+      "minpts_indices": [0, 2, 4, 7],
+      "routes": ["annotated", "dense", "auto"],
+      "tags": ["multi-both", "pilot", "intermediate", "route-comparison"]
+    }
+  ]
+}
